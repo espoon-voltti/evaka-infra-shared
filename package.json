@@ -1,0 +1,15 @@
+{
+  "name": "evaka-infra-shared",
+  "version": "1.0.0",
+  "description": "Shared Terraform modules for eVaka deployments",
+  "scripts": {
+    "prettier": "prettier --write .",
+    "lint:prettier": "prettier --check .",
+    "test": "node --loader ./modules/slack-notifier/lambda/mock-aws-loader.mjs --test"
+  },
+  "private": true,
+  "license": "LGPL-2.1-or-later",
+  "devDependencies": {
+    "prettier": "3.8.3"
+  }
+}

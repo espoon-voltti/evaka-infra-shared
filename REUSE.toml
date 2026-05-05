@@ -1,0 +1,9 @@
+version = 1
+SPDX-PackageName = "evaka-infra-shared"
+SPDX-PackageDownloadLocation = "https://github.com/espoon-voltti/evaka-infra-shared"
+
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 City of Espoo"
+SPDX-License-Identifier = "LGPL-2.1-or-later"
