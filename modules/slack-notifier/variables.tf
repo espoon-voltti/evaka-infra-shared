@@ -9,8 +9,9 @@ variable "account_id" {
 }
 
 variable "alarm_sns_topic_arn" {
-  description = "SNS topic the lambda subscribes to for alarm-state-change notifications."
+  description = "SNS topic the lambda subscribes to for alarm-state-change notifications. Omit to disable SNS-triggered alarm forwarding."
   type        = string
+  default     = null
 }
 
 variable "slack_webhook_ssm_name" {

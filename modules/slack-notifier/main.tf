@@ -89,12 +89,14 @@ resource "aws_lambda_function" "slack_notifier" {
 
 # SNS subscription: alarm state changes -> Lambda
 resource "aws_sns_topic_subscription" "slack_notifier" {
+  count     = var.alarm_sns_topic_arn != null ? 1 : 0
   topic_arn = var.alarm_sns_topic_arn
   protocol  = "lambda"
   endpoint  = aws_lambda_function.slack_notifier.arn
 }
 
 resource "aws_lambda_permission" "sns_invoke" {
+  count         = var.alarm_sns_topic_arn != null ? 1 : 0
   statement_id  = "AllowSNSInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.slack_notifier.function_name
