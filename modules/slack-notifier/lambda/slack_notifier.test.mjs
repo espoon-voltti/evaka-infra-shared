@@ -11,7 +11,10 @@ const {
   formatTimestamp,
   extractThrowSite,
   buildLogInsightsUrl,
-  buildAlarmPayload
+  buildAlarmPayload,
+  resolveMatchedCount,
+  formatErrorCount,
+  formatRemainder
 } = await import('./slack_notifier.mjs')
 
 // The webhook cache is module-scope state. Each caching test needs a pristine
@@ -360,5 +363,54 @@ describe('getSlackWebhookUrl', () => {
     // Caching is postToSlack's responsibility, and only after a confirmed
     // POST — the getter alone must keep hitting SSM.
     assert.equal(ssmStub.getParameterCalls, 2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolveMatchedCount
+// ---------------------------------------------------------------------------
+describe('resolveMatchedCount', () => {
+  it('returns recordsMatched rounded to an integer', () => {
+    assert.equal(resolveMatchedCount({ recordsMatched: 23 }, 10), 23)
+    assert.equal(resolveMatchedCount({ recordsMatched: 23.7 }, 10), 24)
+  })
+
+  it('falls back to resultsLength when statistics is missing', () => {
+    assert.equal(resolveMatchedCount(null, 7), 7)
+    assert.equal(resolveMatchedCount(undefined, 7), 7)
+  })
+
+  it('falls back to resultsLength when recordsMatched is not a number', () => {
+    assert.equal(resolveMatchedCount({}, 5), 5)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// formatErrorCount
+// ---------------------------------------------------------------------------
+describe('formatErrorCount', () => {
+  it('formats the exact count and period', () => {
+    assert.equal(formatErrorCount(23, 5), '23 error(s) in the last 5 minutes')
+  })
+
+  it('formats a single error the same way', () => {
+    assert.equal(formatErrorCount(1, 5), '1 error(s) in the last 5 minutes')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// formatRemainder
+// ---------------------------------------------------------------------------
+describe('formatRemainder', () => {
+  it('reports the exact remainder when more matched than shown', () => {
+    assert.equal(formatRemainder(23, 10), '_...and 13 more not shown_')
+  })
+
+  it('returns null when the shown count equals the matched count', () => {
+    assert.equal(formatRemainder(10, 10), null)
+  })
+
+  it('returns null when fewer matched than shown', () => {
+    assert.equal(formatRemainder(8, 10), null)
   })
 })
