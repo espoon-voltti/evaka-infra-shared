@@ -1,5 +1,7 @@
-import { describe, it } from 'node:test'
+import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
+
+import { ssmStub } from './stub-ssm.mjs'
 
 // Set AWS_REGION before importing the module to avoid side-effect issues
 // and to get deterministic URLs in buildLogInsightsUrl tests.
@@ -11,6 +13,13 @@ const {
   buildLogInsightsUrl,
   buildAlarmPayload
 } = await import('./slack_notifier.mjs')
+
+// The webhook cache is module-scope state. Each caching test needs a pristine
+// module instance; a unique query string forces a fresh evaluation.
+let moduleLoadCount = 0
+function freshModule() {
+  return import(`./slack_notifier.mjs?case=${moduleLoadCount++}`)
+}
 
 // ---------------------------------------------------------------------------
 // formatTimestamp
@@ -242,5 +251,114 @@ describe('buildAlarmPayload', () => {
       url.includes(encodeURIComponent('alarm with spaces & special=chars'))
     )
     assert.ok(!url.includes('alarm with spaces'))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// postToSlack — webhook URL caching
+//
+// Regression cover for the production incident where the SSM parameter held a
+// placeholder ("changeit"). That value was cached for the lifetime of the warm
+// Lambda container, so no Slack message was ever sent. A URL must be cached
+// only after a POST through it has actually succeeded.
+// ---------------------------------------------------------------------------
+describe('postToSlack webhook caching', () => {
+  let originalFetch
+  let originalLog
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+    originalLog = console.log
+    console.log = () => {}
+    ssmStub.reset()
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    console.log = originalLog
+  })
+
+  it('does not cache the URL when fetch rejects', async () => {
+    const { postToSlack } = await freshModule()
+    ssmStub.parameterValue = 'changeit'
+    globalThis.fetch = async () => {
+      // An invalid URL makes fetch reject before returning a response — the
+      // exact shape of the original incident.
+      throw new TypeError('Failed to parse URL from changeit')
+    }
+
+    await assert.rejects(postToSlack({ text: 'hi' }))
+    await assert.rejects(postToSlack({ text: 'hi' }))
+
+    assert.equal(ssmStub.getParameterCalls, 2)
+  })
+
+  it('does not cache the URL on a non-2xx Slack response', async () => {
+    const { postToSlack } = await freshModule()
+    ssmStub.parameterValue = 'https://hooks.slack.com/services/REVOKED'
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 404,
+      text: async () => 'not found'
+    })
+
+    await assert.rejects(postToSlack({ text: 'hi' }))
+    await assert.rejects(postToSlack({ text: 'hi' }))
+
+    assert.equal(ssmStub.getParameterCalls, 2)
+  })
+
+  it('caches the URL after a successful POST and reuses it', async () => {
+    const { postToSlack } = await freshModule()
+    ssmStub.parameterValue = 'https://hooks.slack.com/services/OK'
+    globalThis.fetch = async () => ({ ok: true, status: 200 })
+
+    await postToSlack({ text: 'hi' })
+    await postToSlack({ text: 'hi' })
+
+    assert.equal(ssmStub.getParameterCalls, 1)
+  })
+
+  it('recovers without a restart after the SSM value is fixed', async () => {
+    const { postToSlack } = await freshModule()
+    ssmStub.parameterValue = 'changeit'
+    globalThis.fetch = async (url) => {
+      if (url === 'changeit') throw new TypeError('Failed to parse URL')
+      return { ok: true, status: 200 }
+    }
+
+    await assert.rejects(postToSlack({ text: 'hi' }))
+
+    ssmStub.parameterValue = 'https://hooks.slack.com/services/OK'
+    await postToSlack({ text: 'hi' })
+
+    assert.equal(ssmStub.getParameterCalls, 2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// getSlackWebhookUrl
+// ---------------------------------------------------------------------------
+describe('getSlackWebhookUrl', () => {
+  beforeEach(() => {
+    ssmStub.reset()
+  })
+
+  it('reads SSM every call and never caches on its own', async () => {
+    const { getSlackWebhookUrl } = await freshModule()
+    ssmStub.parameterValue = 'https://hooks.slack.com/services/OK'
+
+    assert.equal(
+      await getSlackWebhookUrl(),
+      'https://hooks.slack.com/services/OK'
+    )
+    assert.equal(
+      await getSlackWebhookUrl(),
+      'https://hooks.slack.com/services/OK'
+    )
+
+    // Caching is postToSlack's responsibility, and only after a confirmed
+    // POST — the getter alone must keep hitting SSM.
+    assert.equal(ssmStub.getParameterCalls, 2)
   })
 })

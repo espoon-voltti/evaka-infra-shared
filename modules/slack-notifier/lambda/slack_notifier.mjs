@@ -16,8 +16,7 @@ async function getSlackWebhookUrl() {
       WithDecryption: true
     })
   )
-  cachedWebhookUrl = result.Parameter.Value
-  return cachedWebhookUrl
+  return result.Parameter.Value
 }
 const LOG_GROUP_NAMES = (process.env.LOG_GROUP_NAMES ?? '')
   .split(',')
@@ -339,6 +338,11 @@ async function postToSlack(payload) {
     const body = await response.text()
     throw new Error(`Failed to post to Slack: ${response.status} ${body}`)
   }
+
+  // Cache only a URL confirmed to work. A bad value (e.g. an unset SSM
+  // placeholder) makes fetch reject before this point, so it is never
+  // cached for the lifetime of a warm container.
+  cachedWebhookUrl = webhookUrl
 }
 
 async function warnSlack(reason) {
@@ -424,5 +428,7 @@ export {
   formatTimestamp,
   extractThrowSite,
   buildLogInsightsUrl,
-  buildAlarmPayload
+  buildAlarmPayload,
+  getSlackWebhookUrl,
+  postToSlack
 }
