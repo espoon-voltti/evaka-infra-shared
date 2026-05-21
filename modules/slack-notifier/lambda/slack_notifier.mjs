@@ -16,8 +16,7 @@ async function getSlackWebhookUrl() {
       WithDecryption: true
     })
   )
-  cachedWebhookUrl = result.Parameter.Value
-  return cachedWebhookUrl
+  return result.Parameter.Value
 }
 const LOG_GROUP_NAMES = (process.env.LOG_GROUP_NAMES ?? '')
   .split(',')
@@ -153,6 +152,7 @@ async function handleLogCheck() {
   // Delays (ms) before each poll attempt: fast initial checks, max. ~10s total.
   const delays = [0, 100, 200, 400, 800, 1200, 1500, 1800, 2000, 2000]
   let results = null
+  let statistics = null
   let lastStatus = 'Running'
   let attempts = 0
   const pollStartMs = Date.now()
@@ -166,6 +166,7 @@ async function handleLogCheck() {
 
     if (response.status === 'Complete') {
       results = response.results ?? []
+      statistics = response.statistics ?? null
       break
     }
 
@@ -194,6 +195,8 @@ async function handleLogCheck() {
   if (results.length === 0) {
     return
   }
+
+  const matchedCount = resolveMatchedCount(statistics, results.length)
 
   const errorLines = []
   for (const row of results.slice(0, 10)) {
@@ -265,11 +268,11 @@ async function handleLogCheck() {
     }
   }
 
-  const hasMore = results.length > 10
   const periodMinutes = Math.floor(LOG_QUERY_SECONDS / 60)
-  const header = `:red_circle: *${
-    hasMore ? 'More than 10' : results.length
-  } error(s) in the last ${periodMinutes} minutes*`
+  const header = `:red_circle: *${formatErrorCount(
+    matchedCount,
+    periodMinutes
+  )}*`
 
   const insightsUrl = buildLogInsightsUrl(
     insightsQuery,
@@ -284,10 +287,11 @@ async function handleLogCheck() {
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: line } })
   }
 
-  if (hasMore) {
+  const remainder = formatRemainder(matchedCount, errorLines.length)
+  if (remainder) {
     blocks.push({
       type: 'section',
-      text: { type: 'mrkdwn', text: `_...and there's more_` }
+      text: { type: 'mrkdwn', text: remainder }
     })
   }
 
@@ -308,7 +312,7 @@ async function handleLogCheck() {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `:warning: *${results.length} error(s) detected but failed to send detailed report*`
+          text: `:warning: *${matchedCount} error(s) detected but failed to send detailed report*`
         }
       },
       {
@@ -339,6 +343,11 @@ async function postToSlack(payload) {
     const body = await response.text()
     throw new Error(`Failed to post to Slack: ${response.status} ${body}`)
   }
+
+  // Cache only a URL confirmed to work. A bad value (e.g. an unset SSM
+  // placeholder) makes fetch reject before this point, so it is never
+  // cached for the lifetime of a warm container.
+  cachedWebhookUrl = webhookUrl
 }
 
 async function warnSlack(reason) {
@@ -420,9 +429,28 @@ function buildLogInsightsUrl(
   )
 }
 
+function resolveMatchedCount(statistics, resultsLength) {
+  const matched = statistics?.recordsMatched
+  return typeof matched === 'number' ? Math.round(matched) : resultsLength
+}
+
+function formatErrorCount(matchedCount, periodMinutes) {
+  return `${matchedCount} error(s) in the last ${periodMinutes} minutes`
+}
+
+function formatRemainder(matchedCount, shownCount) {
+  const remainder = matchedCount - shownCount
+  return remainder > 0 ? `_...and ${remainder} more not shown_` : null
+}
+
 export {
   formatTimestamp,
   extractThrowSite,
   buildLogInsightsUrl,
-  buildAlarmPayload
+  buildAlarmPayload,
+  getSlackWebhookUrl,
+  postToSlack,
+  resolveMatchedCount,
+  formatErrorCount,
+  formatRemainder
 }
