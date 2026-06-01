@@ -1,0 +1,47 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: ['config:recommended', 'schedule:automergeDaily'],
+  automergeStrategy: 'rebase',
+  minimumReleaseAge: '3 days',
+  packageRules: [
+    {
+      matchManagers: ['terraform'],
+      matchDatasources: ['terraform-provider'],
+      groupName: 'Terraform providers',
+      matchUpdateTypes: ['minor', 'patch'],
+      automerge: true
+    },
+    {
+      matchManagers: ['terraform'],
+      matchDatasources: ['terraform-provider'],
+      groupName: 'Terraform providers',
+      matchUpdateTypes: ['major'],
+      automerge: false
+    },
+    {
+      matchManagers: ['terraform'],
+      matchDatasources: ['terraform-module'],
+      groupName: 'Terraform modules',
+      matchUpdateTypes: ['minor', 'patch'],
+      automerge: true
+    },
+    {
+      matchManagers: ['terraform'],
+      matchDatasources: ['terraform-module'],
+      groupName: 'Terraform modules',
+      matchUpdateTypes: ['major'],
+      automerge: false
+    },
+    {
+      matchManagers: ['terraform'],
+      matchDatasources: ['hashicorp-releases'],
+      groupName: 'Terraform',
+      matchUpdateTypes: ['minor', 'patch'],
+      automerge: true
+    },
+    {
+      matchManagers: ['github-actions'],
+      automerge: true
+    }
+  ]
+}
