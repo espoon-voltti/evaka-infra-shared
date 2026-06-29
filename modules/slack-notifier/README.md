@@ -9,9 +9,17 @@ Forwards CloudWatch alarm state changes and application log errors to Slack.
   log groups, the Slack-webhook SSM parameter, and (optionally) the KMS key
   that encrypts it.
 - An SNS subscription from `var.alarm_sns_topic_arn` to the lambda, so alarm
-  state changes are formatted and posted to Slack.
+  state changes are formatted and posted to Slack. The alarm's
+  `alarm_description` is used as the Slack **headline** (e.g. `Backup failed in
+  evaka-staging`), prefixed with `Recovered:` on the OK transition; alarms
+  without a description fall back to `<alarm-name> is now <STATE>`.
 - An EventBridge schedule (`rate(5 minutes)`) that triggers the lambda to
   scan recent log entries and post any errors found.
+- Optional CloudWatch **metric alarms** (`var.metric_alarms`, plus a built-in
+  backup-failed alarm via `var.backup_failed_alarm_enabled`) wired to
+  `var.alarm_sns_topic_arn`, so metric breaches are forwarded to Slack through
+  the same alarm path. No lambda change is needed — the lambda formats any
+  standard CloudWatch alarm message.
 
 The Slack webhook URL itself is not in Terraform state, environment
 variables, or the lambda zip — only the **name** of the SSM parameter holding
@@ -34,8 +42,30 @@ module "slack_notifier" {
     "${var.project}-apigw-${var.environment}",
     "${var.project}-proxy-${var.environment}",
   ]
+
+  # Built-in backup-failed alarm (replaces the central Datadog monitor per account)
+  backup_failed_alarm_enabled = true
+
+  # Additional custom metric alarms
+  metric_alarms = {
+    apigw-5xx = {
+      namespace   = "AWS/ApiGateway"
+      metric_name = "5XXError"
+      dimensions  = { ApiName = "${var.project}-${var.environment}" }
+    }
+  }
 }
 ```
+
+### Metric alarms and region
+
+`metric_alarms` and the built-in backup alarm are created in the **provider
+region** of the module call, and the alarm/SNS topic must be in that same
+region. CloudWatch metrics are per-region: e.g. AWS Backup publishes
+`NumberOfBackupJobsFailed` in each region where a backup (or copy) job runs, so
+an alarm only covers jobs in its own region. Scope to a vault with
+`backup_failed_alarm_dimensions = { BackupVaultName = "..." }` if the
+account-level (empty-dimension) metric does not report data.
 
 ## Inputs
 
@@ -48,10 +78,17 @@ module "slack_notifier" {
 | `slack_webhook_kms_arn`  | `string`       | no       | `""`    | KMS key ARN. Leave empty if the SSM parameter is encrypted with `aws/ssm`.                                     |
 | `log_group_names`        | `list(string)` | yes      | —       | CloudWatch log groups to scan and to use for trace-id deep-links.                                              |
 | `log_query_seconds`      | `number`       | no       | `300`   | Sliding window for the log-error scan. The schedule (`rate(5 minutes)`) is hardcoded and assumes this cadence. |
+| `metric_alarms`          | `map(object)`  | no       | `{}`    | CloudWatch metric alarms to create, keyed by alarm-name suffix. Routed to `alarm_sns_topic_arn`. Per-alarm `notify_on_ok` (default `true`) controls whether the green "recovered" message is sent. See variable for fields/defaults. |
+| `backup_failed_alarm_enabled`    | `bool`         | no       | `false` | Create a built-in `backup-failed` alarm (AWS/Backup `NumberOfBackupJobsFailed`, Sum over 1h > 0). Requires `alarm_sns_topic_arn`. |
+| `backup_failed_alarm_dimensions` | `map(string)`  | no       | `{}`    | Dimensions for the built-in backup alarm. Empty = account/region-level; set `{ BackupVaultName = "..." }` to scope to a vault. |
+
+When `metric_alarms` is non-empty or `backup_failed_alarm_enabled` is `true`,
+`alarm_sns_topic_arn` must be set (enforced by a precondition).
 
 ## Outputs
 
-| Name                   | Description                       |
-| ---------------------- | --------------------------------- |
-| `lambda_function_arn`  | ARN of the slack-notifier lambda. |
-| `lambda_function_name` | Name of the lambda.               |
+| Name                   | Description                                  |
+| ---------------------- | -------------------------------------------- |
+| `lambda_function_arn`  | ARN of the slack-notifier lambda.            |
+| `lambda_function_name` | Name of the lambda.                          |
+| `metric_alarm_arns`    | Map of metric-alarm key to created alarm ARN. |

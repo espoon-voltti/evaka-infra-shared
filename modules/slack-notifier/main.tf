@@ -32,6 +32,28 @@ locals {
       Resource = var.slack_webhook_kms_arn
     }
   ] : []
+
+  # Built-in backup-failed alarm, merged into the user-supplied metric alarms.
+  # Attribute set matches var.metric_alarms (with optionals resolved) so merge()
+  # yields a single uniform map. User entries win on key collision.
+  backup_failed_alarm = var.backup_failed_alarm_enabled ? {
+    backup-failed = {
+      namespace           = "AWS/Backup"
+      metric_name         = "NumberOfBackupJobsFailed"
+      comparison_operator = "GreaterThanThreshold"
+      threshold           = 0
+      statistic           = "Sum"
+      period              = 3600
+      evaluation_periods  = 1
+      datapoints_to_alarm = null
+      treat_missing_data  = "notBreaching"
+      dimensions          = var.backup_failed_alarm_dimensions
+      alarm_description   = "Backup failed in ${var.name_prefix}"
+      notify_on_ok        = false
+    }
+  } : {}
+
+  metric_alarms = merge(local.backup_failed_alarm, var.metric_alarms)
 }
 
 data "archive_file" "slack_notifier" {
@@ -102,6 +124,36 @@ resource "aws_lambda_permission" "sns_invoke" {
   function_name = aws_lambda_function.slack_notifier.function_name
   principal     = "sns.amazonaws.com"
   source_arn    = var.alarm_sns_topic_arn
+}
+
+# Metric alarms -> SNS topic -> lambda -> Slack.
+# The lambda's buildAlarmPayload formats any standard CloudWatch alarm message,
+# so no lambda change is needed to support these.
+resource "aws_cloudwatch_metric_alarm" "metric_alarm" {
+  for_each = local.metric_alarms
+
+  alarm_name          = "${var.name_prefix}-${each.key}"
+  namespace           = each.value.namespace
+  metric_name         = each.value.metric_name
+  comparison_operator = each.value.comparison_operator
+  threshold           = each.value.threshold
+  statistic           = each.value.statistic
+  period              = each.value.period
+  evaluation_periods  = each.value.evaluation_periods
+  datapoints_to_alarm = each.value.datapoints_to_alarm
+  treat_missing_data  = each.value.treat_missing_data
+  dimensions          = each.value.dimensions
+  alarm_description   = each.value.alarm_description
+
+  alarm_actions = [var.alarm_sns_topic_arn]
+  ok_actions    = each.value.notify_on_ok ? [var.alarm_sns_topic_arn] : []
+
+  lifecycle {
+    precondition {
+      condition     = var.alarm_sns_topic_arn != null
+      error_message = "slack-notifier metric alarms require alarm_sns_topic_arn to be set so alarms can route to the lambda."
+    }
+  }
 }
 
 # EventBridge schedule: check logs every 5 minutes

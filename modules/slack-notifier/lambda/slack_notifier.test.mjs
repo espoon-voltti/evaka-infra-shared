@@ -215,25 +215,53 @@ describe('buildAlarmPayload', () => {
     assert.equal(fieldsBlock, undefined)
   })
 
-  it('includes description, reason, and time fields when all present', () => {
+  it('uses AlarmDescription as the headline and shows reason and time fields', () => {
     const payload = buildAlarmPayload(
       {
         AlarmName: 'test-alarm',
         NewStateValue: 'ALARM',
-        AlarmDescription: 'Something broke',
+        AlarmDescription: 'Backup failed in evaka-staging',
         NewStateReason: 'Threshold exceeded',
         StateChangeTime: '2024-01-15T14:30:00Z'
       },
       'eu-west-1'
     )
+    // The description becomes the headline (not the technical "name is now STATE").
+    const headline = payload.attachments[0].blocks[0].text.text
+    assert.ok(headline.includes('Backup failed in evaka-staging'))
+    assert.ok(!headline.includes('is now'))
+    // It is not repeated as a field; only reason and time remain.
     const fieldsBlock = payload.attachments[0].blocks.find(
       (b) => b.type === 'section' && b.fields
     )
     assert.ok(fieldsBlock)
-    assert.equal(fieldsBlock.fields.length, 3)
-    assert.ok(fieldsBlock.fields[0].text.includes('Description'))
-    assert.ok(fieldsBlock.fields[1].text.includes('Reason'))
-    assert.ok(fieldsBlock.fields[2].text.includes('Time'))
+    assert.equal(fieldsBlock.fields.length, 2)
+    assert.ok(!fieldsBlock.fields.some((f) => f.text.includes('Description')))
+    assert.ok(fieldsBlock.fields[0].text.includes('Reason'))
+    assert.ok(fieldsBlock.fields[1].text.includes('Time'))
+  })
+
+  it('prefixes "Recovered:" on an OK transition that has a description', () => {
+    const payload = buildAlarmPayload(
+      {
+        AlarmName: 'test-alarm',
+        NewStateValue: 'OK',
+        AlarmDescription: 'Backup failed in evaka-staging'
+      },
+      'eu-west-1'
+    )
+    const headline = payload.attachments[0].blocks[0].text.text
+    assert.ok(headline.includes(':large_green_circle:'))
+    assert.ok(headline.includes('Recovered: Backup failed in evaka-staging'))
+  })
+
+  it('falls back to "name is now STATE" headline when description is absent', () => {
+    const payload = buildAlarmPayload(
+      { AlarmName: 'test-alarm', NewStateValue: 'ALARM' },
+      'eu-west-1'
+    )
+    const headline = payload.attachments[0].blocks[0].text.text
+    assert.ok(headline.includes('*test-alarm* is now *ALARM*'))
   })
 
   it('encodes special characters in alarm name for CloudWatch URL', () => {
