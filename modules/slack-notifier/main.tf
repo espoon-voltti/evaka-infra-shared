@@ -36,7 +36,9 @@ locals {
   # Built-in backup-failed alarm, merged into the user-supplied metric alarms.
   # Attribute set matches var.metric_alarms (with optionals resolved) so merge()
   # yields a single uniform map. User entries win on key collision.
-  backup_failed_alarm = var.backup_failed_alarm_enabled ? {
+  # Self-gating: enabled by default, but skipped without an SNS topic so a
+  # default-on alarm never breaks a log-scan-only (topic-less) consumer.
+  backup_failed_alarm = var.backup_failed_alarm_enabled && var.alarm_sns_topic_arn != null ? {
     backup-failed = {
       namespace           = "AWS/Backup"
       metric_name         = "NumberOfBackupJobsFailed"

@@ -58,9 +58,9 @@ variable "metric_alarms" {
 }
 
 variable "backup_failed_alarm_enabled" {
-  description = "Create a built-in 'backup-failed' metric alarm (AWS/Backup NumberOfBackupJobsFailed, Sum over 1h > 0) routed to Slack. Replaces the central Datadog 'AWS-backup failed' monitor on a per-account basis. Requires alarm_sns_topic_arn."
+  description = "Create the built-in 'backup-failed' metric alarm (AWS/Backup NumberOfBackupJobsFailed, Sum over 1h > 0) and route it to Slack, replacing the central Datadog 'AWS-backup failed' monitor per account. Enabled by default; automatically skipped when alarm_sns_topic_arn is null (no destination to route to). Set to false to opt out."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "backup_failed_alarm_dimensions" {

@@ -43,8 +43,8 @@ module "slack_notifier" {
     "${var.project}-proxy-${var.environment}",
   ]
 
-  # Built-in backup-failed alarm (replaces the central Datadog monitor per account)
-  backup_failed_alarm_enabled = true
+  # The built-in backup-failed alarm is enabled by default (set
+  # backup_failed_alarm_enabled = false to opt out).
 
   # Additional custom metric alarms
   metric_alarms = {
@@ -79,11 +79,13 @@ account-level (empty-dimension) metric does not report data.
 | `log_group_names`                | `list(string)` | yes      | —       | CloudWatch log groups to scan and to use for trace-id deep-links.                                                                                                                                                                    |
 | `log_query_seconds`              | `number`       | no       | `300`   | Sliding window for the log-error scan. The schedule (`rate(5 minutes)`) is hardcoded and assumes this cadence.                                                                                                                       |
 | `metric_alarms`                  | `map(object)`  | no       | `{}`    | CloudWatch metric alarms to create, keyed by alarm-name suffix. Routed to `alarm_sns_topic_arn`. Per-alarm `notify_on_ok` (default `true`) controls whether the green "recovered" message is sent. See variable for fields/defaults. |
-| `backup_failed_alarm_enabled`    | `bool`         | no       | `false` | Create a built-in `backup-failed` alarm (AWS/Backup `NumberOfBackupJobsFailed`, Sum over 1h > 0). Requires `alarm_sns_topic_arn`.                                                                                                    |
+| `backup_failed_alarm_enabled`    | `bool`         | no       | `true`  | Create a built-in `backup-failed` alarm (AWS/Backup `NumberOfBackupJobsFailed`, Sum over 1h > 0). On by default; auto-skipped when `alarm_sns_topic_arn` is null. Set `false` to opt out.                                            |
 | `backup_failed_alarm_dimensions` | `map(string)`  | no       | `{}`    | Dimensions for the built-in backup alarm. Empty = account/region-level; set `{ BackupVaultName = "..." }` to scope to a vault.                                                                                                       |
 
-When `metric_alarms` is non-empty or `backup_failed_alarm_enabled` is `true`,
-`alarm_sns_topic_arn` must be set (enforced by a precondition).
+When `metric_alarms` is non-empty, `alarm_sns_topic_arn` must be set (enforced
+by a precondition). The built-in backup alarm instead self-skips when the topic
+is null, so a default-on alarm never breaks a topic-less (log-scan-only)
+consumer.
 
 ## Outputs
 
