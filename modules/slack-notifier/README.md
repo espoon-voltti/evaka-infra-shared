@@ -10,9 +10,9 @@ Forwards CloudWatch alarm state changes and application log errors to Slack.
   that encrypts it.
 - An SNS subscription from `var.alarm_sns_topic_arn` to the lambda, so alarm
   state changes are formatted and posted to Slack. The alarm's
-  `alarm_description` is used as the Slack **headline** (e.g. `Backup failed in
-  evaka-staging`), prefixed with `Recovered:` on the OK transition; alarms
-  without a description fall back to `<alarm-name> is now <STATE>`.
+  `alarm_description` becomes the Slack **headline** (prefixed with `Recovered:`
+  on the OK transition); alarms without a description fall back to
+  `<alarm-name> is now <STATE>`.
 - An EventBridge schedule (`rate(5 minutes)`) that triggers the lambda to
   scan recent log entries and post any errors found.
 - Optional CloudWatch **metric alarms** (`var.metric_alarms`, plus a built-in
@@ -69,26 +69,26 @@ account-level (empty-dimension) metric does not report data.
 
 ## Inputs
 
-| Name                     | Type           | Required | Default | Description                                                                                                    |
-| ------------------------ | -------------- | -------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| `name_prefix`            | `string`       | yes      | —       | Prefix for the lambda function, IAM role, and EventBridge rule. Example: `"evakaturku-prod"`.                  |
-| `account_id`             | `string`       | yes      | —       | AWS account ID, used for IAM resource ARNs.                                                                    |
-| `alarm_sns_topic_arn`    | `string`       | yes      | —       | SNS topic the lambda subscribes to for alarm state changes.                                                    |
-| `slack_webhook_ssm_name` | `string`       | yes      | —       | Name of the SecureString SSM parameter holding the Slack webhook URL.                                          |
-| `slack_webhook_kms_arn`  | `string`       | no       | `""`    | KMS key ARN. Leave empty if the SSM parameter is encrypted with `aws/ssm`.                                     |
-| `log_group_names`        | `list(string)` | yes      | —       | CloudWatch log groups to scan and to use for trace-id deep-links.                                              |
-| `log_query_seconds`      | `number`       | no       | `300`   | Sliding window for the log-error scan. The schedule (`rate(5 minutes)`) is hardcoded and assumes this cadence. |
-| `metric_alarms`          | `map(object)`  | no       | `{}`    | CloudWatch metric alarms to create, keyed by alarm-name suffix. Routed to `alarm_sns_topic_arn`. Per-alarm `notify_on_ok` (default `true`) controls whether the green "recovered" message is sent. See variable for fields/defaults. |
-| `backup_failed_alarm_enabled`    | `bool`         | no       | `false` | Create a built-in `backup-failed` alarm (AWS/Backup `NumberOfBackupJobsFailed`, Sum over 1h > 0). Requires `alarm_sns_topic_arn`. |
-| `backup_failed_alarm_dimensions` | `map(string)`  | no       | `{}`    | Dimensions for the built-in backup alarm. Empty = account/region-level; set `{ BackupVaultName = "..." }` to scope to a vault. |
+| Name                             | Type           | Required | Default | Description                                                                                                                                                                                                                          |
+| -------------------------------- | -------------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name_prefix`                    | `string`       | yes      | —       | Prefix for the lambda function, IAM role, and EventBridge rule. Example: `"evakaturku-prod"`.                                                                                                                                        |
+| `account_id`                     | `string`       | yes      | —       | AWS account ID, used for IAM resource ARNs.                                                                                                                                                                                          |
+| `alarm_sns_topic_arn`            | `string`       | yes      | —       | SNS topic the lambda subscribes to for alarm state changes.                                                                                                                                                                          |
+| `slack_webhook_ssm_name`         | `string`       | yes      | —       | Name of the SecureString SSM parameter holding the Slack webhook URL.                                                                                                                                                                |
+| `slack_webhook_kms_arn`          | `string`       | no       | `""`    | KMS key ARN. Leave empty if the SSM parameter is encrypted with `aws/ssm`.                                                                                                                                                           |
+| `log_group_names`                | `list(string)` | yes      | —       | CloudWatch log groups to scan and to use for trace-id deep-links.                                                                                                                                                                    |
+| `log_query_seconds`              | `number`       | no       | `300`   | Sliding window for the log-error scan. The schedule (`rate(5 minutes)`) is hardcoded and assumes this cadence.                                                                                                                       |
+| `metric_alarms`                  | `map(object)`  | no       | `{}`    | CloudWatch metric alarms to create, keyed by alarm-name suffix. Routed to `alarm_sns_topic_arn`. Per-alarm `notify_on_ok` (default `true`) controls whether the green "recovered" message is sent. See variable for fields/defaults. |
+| `backup_failed_alarm_enabled`    | `bool`         | no       | `false` | Create a built-in `backup-failed` alarm (AWS/Backup `NumberOfBackupJobsFailed`, Sum over 1h > 0). Requires `alarm_sns_topic_arn`.                                                                                                    |
+| `backup_failed_alarm_dimensions` | `map(string)`  | no       | `{}`    | Dimensions for the built-in backup alarm. Empty = account/region-level; set `{ BackupVaultName = "..." }` to scope to a vault.                                                                                                       |
 
 When `metric_alarms` is non-empty or `backup_failed_alarm_enabled` is `true`,
 `alarm_sns_topic_arn` must be set (enforced by a precondition).
 
 ## Outputs
 
-| Name                   | Description                                  |
-| ---------------------- | -------------------------------------------- |
-| `lambda_function_arn`  | ARN of the slack-notifier lambda.            |
-| `lambda_function_name` | Name of the lambda.                          |
+| Name                   | Description                                   |
+| ---------------------- | --------------------------------------------- |
+| `lambda_function_arn`  | ARN of the slack-notifier lambda.             |
+| `lambda_function_name` | Name of the lambda.                           |
 | `metric_alarm_arns`    | Map of metric-alarm key to created alarm ARN. |
