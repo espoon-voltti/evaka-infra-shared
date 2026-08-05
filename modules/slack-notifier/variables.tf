@@ -26,8 +26,15 @@ variable "slack_webhook_kms_arn" {
 }
 
 variable "log_group_names" {
-  description = "CloudWatch log groups the lambda scans for errors and uses for trace-id deep-links."
+  description = <<-EOT
+    CloudWatch log groups the lambda scans for errors and uses for trace-id deep-links.
+    Empty turns the scheduled log scan off entirely — no EventBridge schedule and no
+    logs:StartQuery grant — leaving an alarm-forwarder-only deployment. The query
+    itself is eVaka-specific (loggerName filters, `at evaka.` stack frames), so other
+    consumers normally want it off.
+  EOT
   type        = list(string)
+  default     = []
 }
 
 variable "log_query_seconds" {

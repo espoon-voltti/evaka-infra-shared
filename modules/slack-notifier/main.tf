@@ -2,6 +2,10 @@ locals {
   function_name = "${var.name_prefix}-slack-notifier"
   rule_name     = "${var.name_prefix}-slack-notifier-log-error-check"
 
+  # No log groups to scan means the scheduled scan has nothing to do: skip the
+  # schedule and the Insights grants, leaving an alarm-forwarder-only deployment.
+  log_scan_enabled = length(var.log_group_names) > 0
+
   base_iam_statements = [
     {
       Effect   = "Allow"
@@ -10,20 +14,28 @@ locals {
     },
     {
       Effect   = "Allow"
-      Action   = ["logs:StartQuery"]
-      Resource = [for n in var.log_group_names : "arn:aws:logs:*:${var.account_id}:log-group:${n}:*"]
-    },
-    {
-      Effect   = "Allow"
-      Action   = ["logs:GetQueryResults"]
-      Resource = "*"
-    },
-    {
-      Effect   = "Allow"
       Action   = ["ssm:GetParameter"]
       Resource = "arn:aws:ssm:*:${var.account_id}:parameter${var.slack_webhook_ssm_name}"
     },
   ]
+
+  # concat() of two separately gated single-statement lists, not one conditional
+  # returning both: the two statements have different object types (Resource is a
+  # list in one and a string in the other), so Terraform cannot unify them into a
+  # list and compares them as a 2-tuple against the empty one, which fails with
+  # "Inconsistent conditional result types".
+  log_scan_iam_statements = concat(
+    local.log_scan_enabled ? [{
+      Effect   = "Allow"
+      Action   = ["logs:StartQuery"]
+      Resource = [for n in var.log_group_names : "arn:aws:logs:*:${var.account_id}:log-group:${n}:*"]
+    }] : [],
+    local.log_scan_enabled ? [{
+      Effect   = "Allow"
+      Action   = ["logs:GetQueryResults"]
+      Resource = "*"
+    }] : [],
+  )
 
   kms_iam_statements = var.slack_webhook_kms_arn != "" ? [
     {
@@ -86,8 +98,12 @@ resource "aws_iam_role_policy" "slack_notifier" {
   role        = aws_iam_role.slack_notifier.name
 
   policy = jsonencode({
-    Version   = "2012-10-17"
-    Statement = concat(local.base_iam_statements, local.kms_iam_statements)
+    Version = "2012-10-17"
+    Statement = concat(
+      local.base_iam_statements,
+      local.log_scan_iam_statements,
+      local.kms_iam_statements,
+    )
   })
 }
 
@@ -160,20 +176,26 @@ resource "aws_cloudwatch_metric_alarm" "metric_alarm" {
 
 # EventBridge schedule: check logs every 5 minutes
 resource "aws_cloudwatch_event_rule" "log_error_check" {
+  count = local.log_scan_enabled ? 1 : 0
+
   name                = local.rule_name
   description         = "Check for service errors in logs every 5 minutes"
   schedule_expression = "rate(5 minutes)"
 }
 
 resource "aws_cloudwatch_event_target" "log_error_check" {
-  rule = aws_cloudwatch_event_rule.log_error_check.name
+  count = local.log_scan_enabled ? 1 : 0
+
+  rule = aws_cloudwatch_event_rule.log_error_check[0].name
   arn  = aws_lambda_function.slack_notifier.arn
 }
 
 resource "aws_lambda_permission" "eventbridge_invoke" {
+  count = local.log_scan_enabled ? 1 : 0
+
   statement_id  = "AllowEventBridgeInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.slack_notifier.function_name
   principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.log_error_check.arn
+  source_arn    = aws_cloudwatch_event_rule.log_error_check[0].arn
 }

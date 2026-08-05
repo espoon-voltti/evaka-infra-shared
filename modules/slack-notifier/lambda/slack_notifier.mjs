@@ -30,8 +30,7 @@ export async function handler(event) {
   if ('Records' in event) {
     for (const record of event.Records) {
       try {
-        const message = JSON.parse(record.Sns.Message)
-        await handleAlarm(message)
+        await handleSnsRecord(record)
       } catch (err) {
         console.error(
           'Failed to process SNS record:',
@@ -119,9 +118,63 @@ function buildAlarmPayload(message, region) {
   return { attachments: [{ color, blocks }] }
 }
 
+// Not everything on the alarm topic is a CloudWatch alarm. EventBridge rules
+// can publish to it directly (e.g. a session-started or a malware finding),
+// and those carry no alarm state to format — usually an input-transformed
+// sentence rather than an object.
+async function handleSnsRecord(record) {
+  const raw = record.Sns?.Message ?? ''
+
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    parsed = raw
+  }
+
+  if (parsed && typeof parsed === 'object' && parsed.AlarmName) {
+    await handleAlarm(parsed)
+  } else {
+    const text = typeof parsed === 'string' ? parsed : raw
+    await handleNotification(text, record.Sns?.Subject)
+  }
+}
+
 async function handleAlarm(message) {
   const payload = buildAlarmPayload(message, REGION)
   await postToSlack(payload)
+}
+
+async function handleNotification(text, subject) {
+  await postToSlack(buildNotificationPayload(text, subject))
+}
+
+// Slack rejects a section over 3000 characters, and an unbounded event payload
+// would otherwise silently fail the whole post.
+const MAX_SECTION_LENGTH = 2900
+
+function buildNotificationPayload(text, subject) {
+  const body = (text ?? '').trim() || 'Notification with no message body'
+  const truncated =
+    body.length > MAX_SECTION_LENGTH
+      ? body.slice(0, MAX_SECTION_LENGTH) + '...'
+      : body
+
+  const blocks = []
+  if (subject) {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: `:bell: *${subject}*` }
+    })
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncated } })
+  } else {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: `:bell: ${truncated}` }
+    })
+  }
+
+  return { attachments: [{ color: '#ff9800', blocks }] }
 }
 
 async function handleLogCheck() {
@@ -461,6 +514,8 @@ export {
   extractThrowSite,
   buildLogInsightsUrl,
   buildAlarmPayload,
+  buildNotificationPayload,
+  handleSnsRecord,
   getSlackWebhookUrl,
   postToSlack,
   resolveMatchedCount,

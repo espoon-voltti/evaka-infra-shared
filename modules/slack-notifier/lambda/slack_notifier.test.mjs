@@ -12,6 +12,7 @@ const {
   extractThrowSite,
   buildLogInsightsUrl,
   buildAlarmPayload,
+  buildNotificationPayload,
   resolveMatchedCount,
   formatErrorCount,
   formatRemainder
@@ -440,5 +441,125 @@ describe('formatRemainder', () => {
 
   it('returns null when fewer matched than shown', () => {
     assert.equal(formatRemainder(8, 10), null)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildNotificationPayload
+// ---------------------------------------------------------------------------
+describe('buildNotificationPayload', () => {
+  it('renders a subject as the headline and the text below it', () => {
+    const payload = buildNotificationPayload(
+      'Session on bastion',
+      'SSM session'
+    )
+    assert.equal(payload.attachments[0].color, '#ff9800')
+    const blocks = payload.attachments[0].blocks
+    assert.equal(blocks.length, 2)
+    assert.equal(blocks[0].text.text, ':bell: *SSM session*')
+    assert.equal(blocks[1].text.text, 'Session on bastion')
+  })
+
+  it('renders a single block when there is no subject', () => {
+    const payload = buildNotificationPayload('Virus found in an upload')
+    const blocks = payload.attachments[0].blocks
+    assert.equal(blocks.length, 1)
+    assert.equal(blocks[0].text.text, ':bell: Virus found in an upload')
+  })
+
+  it('truncates a body Slack would reject', () => {
+    const payload = buildNotificationPayload('x'.repeat(5000))
+    const text = payload.attachments[0].blocks[0].text.text
+    assert.ok(text.endsWith('...'))
+    assert.ok(text.length < 3000)
+  })
+
+  it('falls back to placeholder text for an empty body', () => {
+    const payload = buildNotificationPayload('   ')
+    assert.ok(
+      payload.attachments[0].blocks[0].text.text.includes(
+        'Notification with no message body'
+      )
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// handleSnsRecord
+//
+// The alarm topic carries both CloudWatch alarms and EventBridge rules that
+// publish to it directly. Before this split, a non-alarm payload was parsed as
+// an alarm and rendered as "Unknown alarm is now UNKNOWN".
+// ---------------------------------------------------------------------------
+describe('handleSnsRecord', () => {
+  let originalFetch
+  let originalLog
+  let posted
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+    originalLog = console.log
+    console.log = () => {}
+    posted = []
+    globalThis.fetch = async (_url, init) => {
+      posted.push(JSON.parse(init.body))
+      return { ok: true, status: 200 }
+    }
+    ssmStub.reset()
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    console.log = originalLog
+  })
+
+  it('formats a CloudWatch alarm message as an alarm', async () => {
+    const { handleSnsRecord } = await freshModule()
+    await handleSnsRecord({
+      Sns: {
+        Message: JSON.stringify({
+          AlarmName: 'evaka-prod-rds-free-storage-space-critical',
+          AlarmDescription: 'RDS instance is running out of disk space',
+          NewStateValue: 'ALARM'
+        })
+      }
+    })
+
+    assert.equal(posted.length, 1)
+    const headline = posted[0].attachments[0].blocks[0].text.text
+    assert.ok(headline.includes(':red_circle:'))
+    assert.ok(headline.includes('running out of disk space'))
+  })
+
+  it('renders an input-transformed string as a notification', async () => {
+    const { handleSnsRecord } = await freshModule()
+    await handleSnsRecord({
+      Sns: { Message: JSON.stringify('SSM session started in 123456789012') }
+    })
+
+    assert.equal(posted.length, 1)
+    const text = posted[0].attachments[0].blocks[0].text.text
+    assert.ok(text.includes(':bell:'))
+    assert.ok(text.includes('SSM session started'))
+  })
+
+  it('renders a non-JSON message as a notification', async () => {
+    const { handleSnsRecord } = await freshModule()
+    await handleSnsRecord({ Sns: { Message: 'plain text alert' } })
+
+    assert.equal(posted.length, 1)
+    assert.ok(
+      posted[0].attachments[0].blocks[0].text.text.includes('plain text alert')
+    )
+  })
+
+  it('renders a JSON object without AlarmName as a notification', async () => {
+    const { handleSnsRecord } = await freshModule()
+    await handleSnsRecord({
+      Sns: { Message: JSON.stringify({ detail: 'some event' }) }
+    })
+
+    assert.equal(posted.length, 1)
+    assert.ok(posted[0].attachments[0].blocks[0].text.text.includes(':bell:'))
   })
 })
