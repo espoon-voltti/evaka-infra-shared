@@ -12,7 +12,8 @@ Forwards CloudWatch alarm state changes and application log errors to Slack.
   state changes are formatted and posted to Slack. The alarm's
   `alarm_description` becomes the Slack **headline** (prefixed with `Recovered:`
   on the OK transition); alarms without a description fall back to
-  `<alarm-name> is now <STATE>`.
+  `<alarm-name> is now <STATE>`. Console deep-links resolve in both the standard
+  `aws` partition and AWS European Sovereign Cloud (`aws-eusc`).
 - An EventBridge schedule (`rate(5 minutes)`) that triggers the lambda to
   scan recent log entries and post any errors found — **only when
   `log_group_names` is non-empty**.
@@ -89,6 +90,7 @@ account-level (empty-dimension) metric does not report data.
 | `account_id`                     | `string`       | yes      | —       | AWS account ID, used for IAM resource ARNs.                                                                                                                                                                                                                        |
 | `alarm_sns_topic_arn`            | `string`       | yes      | —       | SNS topic the lambda subscribes to for alarm state changes.                                                                                                                                                                                                        |
 | `slack_webhook_ssm_name`         | `string`       | yes      | —       | Name of the SecureString SSM parameter holding the Slack webhook URL.                                                                                                                                                                                              |
+| `slack_channel`                  | `string`       | no       | `null`  | Slack channel to post to (e.g. `"#alerts"`), overriding the webhook's own default channel. Needed only where the webhook is shared with other channels rather than dedicated to this deployment.                                                                   |
 | `slack_webhook_kms_arn`          | `string`       | no       | `""`    | KMS key ARN. Leave empty if the SSM parameter is encrypted with `aws/ssm`.                                                                                                                                                                                         |
 | `log_group_names`                | `list(string)` | no       | `[]`    | CloudWatch log groups to scan and to use for trace-id deep-links. Empty turns the scheduled scan off entirely (no schedule, no Insights grants), leaving an alarm-forwarder-only deployment. The query is eVaka-specific, so other consumers normally want it off. |
 | `log_query_seconds`              | `number`       | no       | `300`   | Sliding window for the log-error scan. The schedule (`rate(5 minutes)`) is hardcoded and assumes this cadence.                                                                                                                                                     |

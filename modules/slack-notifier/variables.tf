@@ -19,6 +19,12 @@ variable "slack_webhook_ssm_name" {
   type        = string
 }
 
+variable "slack_channel" {
+  description = "Slack channel to post to (e.g. \"#alerts\"), overriding the webhook's own default channel. Needed only where slack_webhook_ssm_name points at a webhook shared with other channels rather than one dedicated to this deployment."
+  type        = string
+  default     = null
+}
+
 variable "slack_webhook_kms_arn" {
   description = "KMS key ARN for SSM decrypt. Empty means the SSM parameter is encrypted with the AWS-managed aws/ssm key, in which case no kms:Decrypt grant is created."
   type        = string

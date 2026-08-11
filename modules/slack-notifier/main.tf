@@ -1,3 +1,5 @@
+data "aws_partition" "current" {}
+
 locals {
   function_name = "${var.name_prefix}-slack-notifier"
   rule_name     = "${var.name_prefix}-slack-notifier-log-error-check"
@@ -10,12 +12,12 @@ locals {
     {
       Effect   = "Allow"
       Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-      Resource = "arn:aws:logs:*:${var.account_id}:log-group:/aws/lambda/${local.function_name}:*"
+      Resource = "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:/aws/lambda/${local.function_name}:*"
     },
     {
       Effect   = "Allow"
       Action   = ["ssm:GetParameter"]
-      Resource = "arn:aws:ssm:*:${var.account_id}:parameter${var.slack_webhook_ssm_name}"
+      Resource = "arn:${data.aws_partition.current.partition}:ssm:*:${var.account_id}:parameter${var.slack_webhook_ssm_name}"
     },
   ]
 
@@ -28,7 +30,7 @@ locals {
     local.log_scan_enabled ? [{
       Effect   = "Allow"
       Action   = ["logs:StartQuery"]
-      Resource = [for n in var.log_group_names : "arn:aws:logs:*:${var.account_id}:log-group:${n}:*"]
+      Resource = [for n in var.log_group_names : "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:${n}:*"]
     }] : [],
     local.log_scan_enabled ? [{
       Effect   = "Allow"
@@ -77,7 +79,7 @@ data "archive_file" "slack_notifier" {
 }
 
 resource "aws_iam_role" "slack_notifier" {
-  name_prefix = "${var.name_prefix}-slack-notifier-"
+  name = "${var.name_prefix}-slack-notifier"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -121,6 +123,7 @@ resource "aws_lambda_function" "slack_notifier" {
   environment {
     variables = {
       SLACK_WEBHOOK_SSM_NAME = var.slack_webhook_ssm_name
+      SLACK_CHANNEL          = var.slack_channel != null ? var.slack_channel : ""
       LOG_GROUP_NAMES        = join(",", var.log_group_names)
       LOG_QUERY_SECONDS      = tostring(var.log_query_seconds)
     }

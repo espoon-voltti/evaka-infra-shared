@@ -26,11 +26,13 @@ const REGION = process.env.AWS_REGION ?? 'eu-west-1'
 
 const logsClient = new CloudWatchLogsClient({ region: REGION })
 
-export async function handler(event) {
+export async function handler(event, context) {
+  const partition = context.invokedFunctionArn.split(':')[1]
+
   if ('Records' in event) {
     for (const record of event.Records) {
       try {
-        await handleSnsRecord(record)
+        await handleSnsRecord(record, partition)
       } catch (err) {
         console.error(
           'Failed to process SNS record:',
@@ -41,7 +43,7 @@ export async function handler(event) {
     }
   } else if (event.source === 'aws.events') {
     try {
-      await handleLogCheck()
+      await handleLogCheck(partition)
     } catch (err) {
       console.error('Failed to handle log check:', err)
     }
@@ -50,7 +52,11 @@ export async function handler(event) {
   }
 }
 
-function buildAlarmPayload(message, region) {
+function consoleDomain(partition) {
+  return partition === 'aws-eusc' ? 'amazonaws.eu' : 'aws.amazon.com'
+}
+
+function buildAlarmPayload(message, region, partition = 'aws') {
   const alarmName = message.AlarmName ?? 'Unknown alarm'
   const newState = message.NewStateValue ?? 'UNKNOWN'
   const reason = message.NewStateReason ?? ''
@@ -61,7 +67,7 @@ function buildAlarmPayload(message, region) {
   const emoji = newState === 'ALARM' ? ':red_circle:' : ':large_green_circle:'
 
   const consoleUrl =
-    `https://${region}.console.aws.amazon.com/cloudwatch/deeplink.js` +
+    `https://${region}.console.${consoleDomain(partition)}/cloudwatch/deeplink.js` +
     `?region=${region}#alarmsV2:alarm/${encodeURIComponent(alarmName)}`
 
   // Headline: prefer a human-readable AlarmDescription (e.g. "Backup failed in
@@ -122,7 +128,7 @@ function buildAlarmPayload(message, region) {
 // can publish to it directly (e.g. a session-started or a malware finding),
 // and those carry no alarm state to format — usually an input-transformed
 // sentence rather than an object.
-async function handleSnsRecord(record) {
+async function handleSnsRecord(record, partition) {
   const raw = record.Sns?.Message ?? ''
 
   let parsed
@@ -133,15 +139,15 @@ async function handleSnsRecord(record) {
   }
 
   if (parsed && typeof parsed === 'object' && parsed.AlarmName) {
-    await handleAlarm(parsed)
+    await handleAlarm(parsed, partition)
   } else {
     const text = typeof parsed === 'string' ? parsed : raw
     await handleNotification(text, record.Sns?.Subject)
   }
 }
 
-async function handleAlarm(message) {
-  const payload = buildAlarmPayload(message, REGION)
+async function handleAlarm(message, partition) {
+  const payload = buildAlarmPayload(message, REGION, partition)
   await postToSlack(payload)
 }
 
@@ -177,7 +183,7 @@ function buildNotificationPayload(text, subject) {
   return { attachments: [{ color: '#ff9800', blocks }] }
 }
 
-async function handleLogCheck() {
+async function handleLogCheck(partition) {
   if (LOG_GROUP_NAMES.length === 0) {
     console.log('LOG_GROUP_NAMES not set, skipping log check')
     return
@@ -293,7 +299,9 @@ async function handleLogCheck() {
           traceQuery,
           LOG_GROUP_NAMES,
           startTime,
-          endTime
+          endTime,
+          REGION,
+          partition
         )
         line1Parts.push(`<${traceUrl}|${ts}>`)
       } else {
@@ -344,7 +352,9 @@ async function handleLogCheck() {
     insightsQuery,
     LOG_GROUP_NAMES,
     startTime,
-    endTime
+    endTime,
+    REGION,
+    partition
   )
 
   const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: header } }]
@@ -397,10 +407,12 @@ async function handleLogCheck() {
 
 async function postToSlack(payload) {
   const webhookUrl = await getSlackWebhookUrl()
+  const channel = process.env.SLACK_CHANNEL
+  const body = channel ? { ...payload, channel } : payload
   const response = await fetch(webhookUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(body)
   })
 
   console.log(`Slack response: ${response.status}`)
@@ -472,7 +484,8 @@ function buildLogInsightsUrl(
   logGroups,
   startTime,
   endTime,
-  region = REGION
+  region = REGION,
+  partition = 'aws'
 ) {
   // CloudWatch console URL fragment encoding is undocumented by AWS.
   // See https://github.com/aws/aws-sdk-js-v3/issues/6016
@@ -483,7 +496,7 @@ function buildLogInsightsUrl(
     )
   const sourceList = logGroups.map((g) => `~'${encode(g)}`).join('')
   return (
-    `https://${region}.console.aws.amazon.com/cloudwatch/home` +
+    `https://${region}.console.${consoleDomain(partition)}/cloudwatch/home` +
     `?region=${region}#logsV2:logs-insights` +
     `$3FqueryDetail$3D~(` +
     `end~${endTime * 1000}` +
