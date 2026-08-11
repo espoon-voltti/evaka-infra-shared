@@ -6,7 +6,10 @@ locals {
 
   # No log groups to scan means the scheduled scan has nothing to do: skip the
   # schedule and the Insights grants, leaving an alarm-forwarder-only deployment.
-  log_scan_enabled = length(var.log_group_names) > 0
+  log_scan_enabled = length(var.log_group_names) > 0 || length(var.log_sources) > 0
+
+  log_source_prefixes    = distinct(flatten([for s in var.log_sources : s.log_group_name_prefixes]))
+  log_source_exact_names = distinct(flatten([for s in var.log_sources : s.log_group_names]))
 
   base_iam_statements = [
     {
@@ -27,10 +30,29 @@ locals {
   # list and compares them as a 2-tuple against the empty one, which fails with
   # "Inconsistent conditional result types".
   log_scan_iam_statements = concat(
-    local.log_scan_enabled ? [{
+    length(var.log_group_names) > 0 ? [{
       Effect   = "Allow"
       Action   = ["logs:StartQuery"]
       Resource = [for n in var.log_group_names : "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:${n}:*"]
+    }] : [],
+    length(local.log_source_exact_names) > 0 || length(local.log_source_prefixes) > 0 ? [{
+      Effect = "Allow"
+      Action = ["logs:StartQuery"]
+      Resource = concat(
+        [for n in local.log_source_exact_names : "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:${n}:*"],
+        [for p in local.log_source_prefixes : "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:${p}*:*"],
+      )
+    }] : [],
+    # DescribeLogGroups cannot be scoped to log groups by name: being a list
+    # operation it authorizes against an ARN with an empty log-group name
+    # (`log-group::log-stream:`, per an ESC AccessDenied), which no prefixed
+    # resource matches. Only this metadata listing is account-wide — reading log
+    # content still requires the prefix-scoped StartQuery grant above, and the
+    # lambda asks for one prefix at a time regardless.
+    length(local.log_source_prefixes) > 0 ? [{
+      Effect   = "Allow"
+      Action   = ["logs:DescribeLogGroups"]
+      Resource = "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:*"
     }] : [],
     local.log_scan_enabled ? [{
       Effect   = "Allow"
@@ -126,6 +148,7 @@ resource "aws_lambda_function" "slack_notifier" {
       SLACK_CHANNEL          = var.slack_channel != null ? var.slack_channel : ""
       LOG_GROUP_NAMES        = join(",", var.log_group_names)
       LOG_QUERY_SECONDS      = tostring(var.log_query_seconds)
+      LOG_SOURCES_JSON       = jsonencode(var.log_sources)
     }
   }
 }

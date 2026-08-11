@@ -1,7 +1,8 @@
 import {
   CloudWatchLogsClient,
   StartQueryCommand,
-  GetQueryResultsCommand
+  GetQueryResultsCommand,
+  DescribeLogGroupsCommand
 } from '@aws-sdk/client-cloudwatch-logs'
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm'
 
@@ -22,7 +23,75 @@ const LOG_GROUP_NAMES = (process.env.LOG_GROUP_NAMES ?? '')
   .split(',')
   .filter(Boolean)
 const LOG_QUERY_SECONDS = parseInt(process.env.LOG_QUERY_SECONDS ?? '300', 10)
+const LOG_SOURCES = JSON.parse(process.env.LOG_SOURCES_JSON ?? '{}')
 const REGION = process.env.AWS_REGION ?? 'eu-west-1'
+
+// The lambda's overlap and CloudWatch-indexing-delay assume the EventBridge
+// schedule's rate(5 minutes) cadence, same as LOG_QUERY_SECONDS's default.
+const OVERLAP_SECONDS = 10
+const CLOUDWATCH_INDEXING_DELAY_SECONDS = 5 * 60
+
+// Delays (ms) before each GetQueryResults poll: fast initial checks, max. ~10s total.
+const POLL_DELAYS_MS = [0, 100, 200, 400, 800, 1200, 1500, 1800, 2000, 2000]
+
+// Field-name mapping per logging convention a log_sources entry can select via
+// `format`. EVAKA_PRESET below is the same idea for log_group_names's own scan,
+// kept out of this table because `format` must not select it.
+// httpMethod/httpPath are omitted for a format whose error entries carry no
+// request context; the endpoint column then falls back to the logger name.
+// asyncJobPoolLogger must match the app's own logger, which appends the pool id:
+// `<throw_site_package_prefix>.<asyncJobPoolLogger>.<pool id>`.
+const FORMAT_PRESETS = {
+  'logback-json': {
+    level: 'logLevel',
+    logger: 'loggerName',
+    message: 'message',
+    exception: 'exception',
+    stackTrace: 'stackTrace',
+    httpMethod: 'httpMethod',
+    httpPath: 'path',
+    appName: 'appName',
+    traceId: 'traceId',
+    asyncJobPoolLogger: 'shared.asyncjob.AsyncJobPool'
+  },
+  'pino-json': {
+    level: 'level',
+    logger: 'name',
+    message: 'message',
+    exception: 'exception',
+    stackTrace: 'stackTrace',
+    appName: 'appName',
+    traceId: 'traceId'
+  }
+}
+
+// eVaka's own shape. It emits both an actual `path` and a templated `httpRoute`,
+// and shows the route in the Insights endpoint column while its Slack lines show
+// the path — hence endpointPath alongside httpPath. Its async-job pool logger
+// (`evaka.core.shared.async.AsyncJobPool`) shares no package prefix with its
+// throw-site frames (`at evaka.`), so its mutes stay explicit below rather than
+// being derived.
+const EVAKA_PRESET = {
+  level: 'logLevel',
+  logger: 'loggerName',
+  message: 'message',
+  exception: 'exception',
+  stackTrace: 'stackTrace',
+  httpMethod: 'httpMethod',
+  httpPath: 'path',
+  endpointPath: 'httpRoute',
+  appName: 'appName',
+  traceId: 'traceId'
+}
+
+const EVAKA_NOISE_FILTERS = [
+  'filter not (loggerName like /^evaka\\.core\\.shared\\.async\\.AsyncJobPool\\./ and meta.remainingAttempts > 0)',
+  'filter loggerName not like /^evaka\\.core\\.varda\\./',
+  'filter not (exception = "UnableToExecuteStatementException" and (message like /staff_attendance_no_overlaps/ or message like /staff_attendance_plan_no_overlaps/))'
+]
+
+// CloudWatch Logs Insights rejects a query naming more than this many log groups.
+const MAX_QUERY_LOG_GROUPS = 50
 
 const logsClient = new CloudWatchLogsClient({ region: REGION })
 
@@ -42,18 +111,24 @@ export async function handler(event, context) {
       }
     }
   } else if (event.source === 'aws.events') {
-    try {
-      await handleLogCheck(partition)
-    } catch (err) {
-      console.error('Failed to handle log check:', err)
-    }
+    // Concurrently: each scan polls for its query for up to ~10s, which
+    // sequentially would run several scans past the lambda's timeout — and a
+    // timed-out invocation cannot report anything to Slack.
+    await Promise.all([
+      runScan('the eVaka log scan', () => handleLogCheck(partition)),
+      ...Object.entries(LOG_SOURCES).map(([sourceName, source]) =>
+        runScan(`log source "${sourceName}"`, () =>
+          handleLogSourceCheck(sourceName, source, partition)
+        )
+      )
+    ])
   } else {
     console.log('Unknown event type:', JSON.stringify(event))
   }
 }
 
 function consoleDomain(partition) {
-  return partition === 'aws-eusc' ? 'amazonaws.eu' : 'aws.amazon.com'
+  return partition === 'aws-eusc' ? 'amazonaws-eusc.eu' : 'aws.amazon.com'
 }
 
 function buildAlarmPayload(message, region, partition = 'aws') {
@@ -183,52 +258,181 @@ function buildNotificationPayload(text, subject) {
   return { attachments: [{ color: '#ff9800', blocks }] }
 }
 
+function buildQueryParts(preset, throwSitePackagePrefix, extraNoiseFilters) {
+  const parts = [`filter tolower(${preset.level}) = "error"`]
+  if (throwSitePackagePrefix && preset.asyncJobPoolLogger) {
+    const loggerPrefix = escapeRegExp(
+      `${throwSitePackagePrefix}.${preset.asyncJobPoolLogger}.`
+    )
+    parts.push(
+      `filter not (${preset.logger} like /^${loggerPrefix}/ and meta.remainingAttempts > 0)`
+    )
+  }
+  parts.push(...(extraNoiseFilters ?? []), 'sort @timestamp asc', 'limit 20')
+  return parts
+}
+
+function buildInsightsFields(preset) {
+  const endpointPath = preset.endpointPath ?? preset.httpPath
+  const endpoint =
+    preset.httpMethod && endpointPath
+      ? `if(not isempty(${preset.httpMethod}) and not isempty(${endpointPath}), concat(${preset.httpMethod}, " ", ${endpointPath}), ${preset.logger})`
+      : preset.logger
+  return (
+    `fields @timestamp, ${preset.appName}, ${endpoint} as endpoint, ` +
+    `${preset.level}, ${preset.message}, ${preset.stackTrace}`
+  )
+}
+
+async function discoverLogGroupNames(prefixes) {
+  const names = new Set()
+  for (const prefix of prefixes) {
+    let nextToken
+    do {
+      const response = await logsClient.send(
+        new DescribeLogGroupsCommand({ logGroupNamePrefix: prefix, nextToken })
+      )
+      for (const group of response.logGroups ?? []) {
+        if (group.logGroupName) names.add(group.logGroupName)
+      }
+      nextToken = response.nextToken
+    } while (nextToken)
+  }
+  return names
+}
+
+async function resolveSourceLogGroupNames(source) {
+  // Explicitly configured names go in first so they survive the cap below.
+  const names = new Set(source.log_group_names ?? [])
+  if (source.log_group_name_prefixes?.length) {
+    for (const name of await discoverLogGroupNames(
+      source.log_group_name_prefixes
+    )) {
+      names.add(name)
+    }
+  }
+
+  const resolved = [...names]
+  if (resolved.length <= MAX_QUERY_LOG_GROUPS) return resolved
+
+  const dropped = resolved.slice(MAX_QUERY_LOG_GROUPS)
+  console.warn(
+    `Resolved ${resolved.length} log groups, more than the ${MAX_QUERY_LOG_GROUPS} a query accepts — not scanning: ${dropped.join(
+      ', '
+    )}`
+  )
+  return resolved.slice(0, MAX_QUERY_LOG_GROUPS)
+}
+
+// A scan that cannot run at all — a denied DescribeLogGroups, too many log
+// groups for one query — otherwise looks exactly like a scan that found nothing,
+// so it is reported the same way a query that never completes is.
+async function runScan(label, scan) {
+  try {
+    await scan()
+  } catch (err) {
+    console.error(`Failed to run ${label}:`, err)
+    try {
+      await warnSlack(`${label} could not be run: ${err.message ?? err}`)
+    } catch (warnErr) {
+      console.error(`Failed to warn Slack about ${label}:`, warnErr)
+    }
+  }
+}
+
 async function handleLogCheck(partition) {
   if (LOG_GROUP_NAMES.length === 0) {
-    console.log('LOG_GROUP_NAMES not set, skipping log check')
     return
   }
 
+  await runLogScan({
+    label: '',
+    logGroupNames: LOG_GROUP_NAMES,
+    preset: EVAKA_PRESET,
+    queryParts: buildQueryParts(EVAKA_PRESET, '', EVAKA_NOISE_FILTERS),
+    throwSitePackagePrefix: 'evaka',
+    partition
+  })
+}
+
+// A source name alone (e.g. "service") is ambiguous once one Lambda/channel
+// serves several projects on the same account (modules/baseline is one
+// Lambda per account; its README notes an account can host several
+// projects). Prefer "<app-env>/<sourceName>" parsed off the resolved log
+// group's /aws/ecs/<app-env>/<component> convention — not name_prefix, which
+// is the Lambda's own account-level name and can differ from the environment
+// that actually owns the log group (e.g. an account named "dev" running the
+// "staging" environment). Falls back to the source name alone when a source
+// resolves to zero or several log groups, or an unfamiliar naming scheme.
+function deriveSourceLabel(sourceName, logGroupNames) {
+  if (logGroupNames.length === 1) {
+    const match = logGroupNames[0].match(/^\/aws\/ecs\/(.+)\/[^/]+$/)
+    if (match) return `${match[1]}/${sourceName}`
+  }
+  return sourceName
+}
+
+async function handleLogSourceCheck(sourceName, source, partition) {
+  const logGroupNames = await resolveSourceLogGroupNames(source)
+  if (logGroupNames.length === 0) {
+    console.log(`Log source "${sourceName}" has no log groups yet, skipping`)
+    return
+  }
+
+  const preset = FORMAT_PRESETS[source.format]
+  await runLogScan({
+    label: deriveSourceLabel(sourceName, logGroupNames),
+    logGroupNames,
+    preset,
+    queryParts: buildQueryParts(
+      preset,
+      source.throw_site_package_prefix,
+      source.extra_noise_filters
+    ),
+    throwSitePackagePrefix: source.throw_site_package_prefix,
+    partition
+  })
+}
+
+// An empty label is the eVaka scan, whose Slack and log strings predate
+// log_sources and carry no source name.
+async function runLogScan({
+  label,
+  logGroupNames,
+  preset,
+  queryParts,
+  throwSitePackagePrefix,
+  partition
+}) {
+  const labelPrefix = label ? `[${label}] ` : ''
+  const scanName = label ? ` for "${label}"` : ''
+
   // We might miss an error due to trigger drift and indexing delay,
   // so we overlap the query window a bit and allow some time for logs to be indexed before querying.
-  const OVERLAP_SECONDS = 10
-  const CLOUDWATCH_INDEXING_DELAY_SECONDS = 5 * 60
   const endTime =
     Math.floor(Date.now() / 1000) - CLOUDWATCH_INDEXING_DELAY_SECONDS
   const startTime = endTime - LOG_QUERY_SECONDS - OVERLAP_SECONDS
 
-  const queryParts = [
-    'filter tolower(logLevel) = "error"',
-    'filter not (loggerName like /^evaka\\.core\\.shared\\.async\\.AsyncJobPool\\./ and meta.remainingAttempts > 0)',
-    'filter loggerName not like /^evaka\\.core\\.varda\\./',
-    'filter not (exception = "UnableToExecuteStatementException" and (message like /staff_attendance_no_overlaps/ or message like /staff_attendance_plan_no_overlaps/))',
-    'sort @timestamp asc',
-    'limit 20'
-  ]
   const query = ['fields @timestamp, @message', ...queryParts].join('\n| ')
-  const insightsFields =
-    'fields @timestamp, appName, if(not isempty(httpMethod) and not isempty(httpRoute), concat(httpMethod, " ", httpRoute), loggerName) as endpoint, logLevel, message, stackTrace'
+  const insightsFields = buildInsightsFields(preset)
   const insightsQuery = [insightsFields, ...queryParts].join('\n| ')
 
   const startResponse = await logsClient.send(
     new StartQueryCommand({
-      logGroupNames: LOG_GROUP_NAMES,
+      logGroupNames,
       startTime,
       endTime,
       queryString: query
     })
   )
-
   const queryId = startResponse.queryId
 
-  // Delays (ms) before each poll attempt: fast initial checks, max. ~10s total.
-  const delays = [0, 100, 200, 400, 800, 1200, 1500, 1800, 2000, 2000]
   let results = null
   let statistics = null
   let lastStatus = 'Running'
   let attempts = 0
   const pollStartMs = Date.now()
-  for (const delayMs of delays) {
+  for (const delayMs of POLL_DELAYS_MS) {
     if (delayMs > 0) await sleep(delayMs)
     attempts++
 
@@ -245,7 +449,7 @@ async function handleLogCheck(partition) {
     lastStatus = response.status
     if (['Failed', 'Cancelled', 'Timeout'].includes(response.status)) {
       console.error(
-        `Log query ended with status: ${
+        `Log query${scanName} ended with status: ${
           response.status
         } after ${attempts} attempts (${Date.now() - pollStartMs}ms elapsed)`
       )
@@ -256,10 +460,10 @@ async function handleLogCheck(partition) {
   if (!results) {
     const elapsedMs = Date.now() - pollStartMs
     console.warn(
-      `Log query failed — last status: ${lastStatus}, ${attempts} attempts, ${elapsedMs}ms elapsed`
+      `Log query${scanName} failed — last status: ${lastStatus}, ${attempts} attempts, ${elapsedMs}ms elapsed`
     )
     await warnSlack(
-      `log error query failed — last status: ${lastStatus}, ${attempts} attempts, ${elapsedMs}ms elapsed`
+      `log error query${scanName} failed — last status: ${lastStatus}, ${attempts} attempts, ${elapsedMs}ms elapsed`
     )
     return
   }
@@ -277,80 +481,85 @@ async function handleLogCheck(partition) {
 
     if (!message) continue
 
+    // Only the parse is tolerated: a log line that isn't JSON is expected and
+    // renders raw, whereas a failure to format a parsed one is a defect and must
+    // not masquerade as an unparseable line. Field values are coerced rather
+    // than trusted, since nothing constrains what an app puts in them.
+    let parsed
     try {
-      const parsed = JSON.parse(message)
-      const ts = formatTimestamp(timestamp)
-      const logger = parsed.loggerName ?? ''
-      let msg = parsed.message ?? ''
-      if (msg.length > 200) msg = msg.slice(0, 200) + '...'
-
-      const traceId = parsed.traceId ?? ''
-      const safeTraceId = traceId.replace(/[^a-fA-F0-9\-]/g, '')
-
-      // Line 1: timestamp, HTTP method/path, logger
-      const line1Parts = []
-      if (safeTraceId) {
-        const traceQuery = [
-          'fields @timestamp, appName, if(not isempty(httpMethod) and not isempty(httpRoute), concat(httpMethod, " ", httpRoute), loggerName) as endpoint, logLevel, message, stackTrace',
-          `filter traceId = "${safeTraceId}"`,
-          'sort @timestamp asc'
-        ].join('\n| ')
-        const traceUrl = buildLogInsightsUrl(
-          traceQuery,
-          LOG_GROUP_NAMES,
-          startTime,
-          endTime,
-          REGION,
-          partition
-        )
-        line1Parts.push(`<${traceUrl}|${ts}>`)
-      } else {
-        line1Parts.push(ts)
-      }
-
-      const method = parsed.httpMethod ?? ''
-      const path = parsed.path ?? ''
-      if (method && path) {
-        line1Parts.push(`*${method} ${path}*`)
-      }
-
-      if (logger) {
-        const shortLogger = logger.split('.').pop()
-        line1Parts.push(shortLogger)
-      }
-
-      // Line 2: exception class + message
-      const exception = parsed.exception ?? ''
-      const shortException = exception ? exception.split('.').pop() : ''
-      const line2 = shortException ? `${shortException}: ${msg}` : msg
-
-      // Line 3: stack trace throw site
-      let line3 = ''
-      if (parsed.stackTrace) {
-        const traceLine = extractThrowSite(parsed.stackTrace)
-        if (traceLine) {
-          line3 = `\`${traceLine}\``
-        }
-      }
-
-      const lines = [line1Parts.join(' '), line2]
-      if (line3) lines.push(line3)
-      errorLines.push(lines.join('\n'))
+      parsed = JSON.parse(message)
     } catch {
-      const shortMsg = message.slice(0, 200)
-      errorLines.push(`\`${formatTimestamp(timestamp)}\` ${shortMsg}`)
+      errorLines.push(
+        `\`${formatTimestamp(timestamp)}\` ${message.slice(0, 200)}`
+      )
+      continue
     }
+
+    const ts = formatTimestamp(timestamp)
+    const logger = String(parsed[preset.logger] ?? '')
+    let msg = String(parsed[preset.message] ?? '')
+    if (msg.length > 200) msg = msg.slice(0, 200) + '...'
+
+    const traceId = String(parsed[preset.traceId] ?? '')
+    const safeTraceId = traceId.replace(/[^a-fA-F0-9\-]/g, '')
+
+    const line1Parts = []
+    if (safeTraceId) {
+      const traceQuery = [
+        insightsFields,
+        `filter ${preset.traceId} = "${safeTraceId}"`,
+        'sort @timestamp asc'
+      ].join('\n| ')
+      const traceUrl = buildLogInsightsUrl(
+        traceQuery,
+        logGroupNames,
+        startTime,
+        endTime,
+        REGION,
+        partition
+      )
+      line1Parts.push(`<${traceUrl}|${ts}>`)
+    } else {
+      line1Parts.push(ts)
+    }
+
+    const method = preset.httpMethod ? (parsed[preset.httpMethod] ?? '') : ''
+    const path = preset.httpPath ? (parsed[preset.httpPath] ?? '') : ''
+    if (method && path) {
+      line1Parts.push(`*${method} ${path}*`)
+    }
+
+    if (logger) {
+      line1Parts.push(logger.split('.').pop())
+    }
+
+    const exception = String(parsed[preset.exception] ?? '')
+    const shortException = exception ? exception.split('.').pop() : ''
+    const line2 = shortException ? `${shortException}: ${msg}` : msg
+
+    let line3 = ''
+    if (throwSitePackagePrefix && parsed[preset.stackTrace]) {
+      const traceLine = extractThrowSite(
+        String(parsed[preset.stackTrace]),
+        throwSitePackagePrefix
+      )
+      if (traceLine) line3 = `\`${traceLine}\``
+    }
+
+    const lines = [line1Parts.join(' '), line2]
+    if (line3) lines.push(line3)
+    errorLines.push(lines.join('\n'))
   }
 
   const periodMinutes = Math.floor(LOG_QUERY_SECONDS / 60)
-  const header = `:red_circle: *${formatErrorCount(
+  const header = `:red_circle: *${labelPrefix}${formatErrorCount(
     matchedCount,
     periodMinutes
   )}*`
 
   const insightsUrl = buildLogInsightsUrl(
     insightsQuery,
-    LOG_GROUP_NAMES,
+    logGroupNames,
     startTime,
     endTime,
     REGION,
@@ -382,13 +591,16 @@ async function handleLogCheck(partition) {
   try {
     await postToSlack({ attachments: [{ color: '#d32f2f', blocks }] })
   } catch (err) {
-    console.error('Failed to post detailed message, trying fallback:', err)
+    console.error(
+      `Failed to post detailed message${scanName}, trying fallback:`,
+      err
+    )
     const fallbackBlocks = [
       {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `:warning: *${matchedCount} error(s) detected but failed to send detailed report*`
+          text: `:warning: *${labelPrefix}${matchedCount} error(s) detected but failed to send detailed report*`
         }
       },
       {
@@ -462,21 +674,24 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function extractThrowSite(stackTrace) {
+function extractThrowSite(stackTrace, packagePrefix = 'evaka') {
+  const marker = `at ${packagePrefix}.`
+  const pattern = new RegExp(`^at ${escapeRegExp(packagePrefix)}\\.(.+)$`)
   const lines = stackTrace.split('\n')
   for (const line of lines) {
     const trimmed = line.trim()
-    // Find first "at" line from evaka code (skip framework/library frames)
-    if (
-      trimmed.startsWith('at evaka.') &&
-      !trimmed.includes('ExceptionHandler')
-    ) {
+    // Find first "at" line from the app's own code (skip framework/library frames)
+    if (trimmed.startsWith(marker) && !trimmed.includes('ExceptionHandler')) {
       // Extract "at evaka.foo.Bar.method(File.kt:42)" -> "foo.Bar.method(File.kt:42)"
-      const match = trimmed.match(/^at evaka\.(.+)$/)
+      const match = trimmed.match(pattern)
       if (match) return match[1]
     }
   }
   return null
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function buildLogInsightsUrl(
@@ -533,5 +748,14 @@ export {
   postToSlack,
   resolveMatchedCount,
   formatErrorCount,
-  formatRemainder
+  formatRemainder,
+  FORMAT_PRESETS,
+  buildQueryParts,
+  buildInsightsFields,
+  EVAKA_PRESET,
+  discoverLogGroupNames,
+  resolveSourceLogGroupNames,
+  deriveSourceLabel,
+  handleLogCheck,
+  handleLogSourceCheck
 }

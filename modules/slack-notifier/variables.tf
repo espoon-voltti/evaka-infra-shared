@@ -43,6 +43,41 @@ variable "log_group_names" {
   default     = []
 }
 
+variable "log_sources" {
+  description = <<-EOT
+    Additional log sources for the scheduled error scan, keyed by an arbitrary
+    short name used to label its Slack messages (e.g. "service", "api-gateway").
+    Independent of and additive to log_group_names: each source runs its own
+    Insights query, since `format` selects a different field mapping per source
+    rather than the fixed eVaka one log_group_names uses.
+
+    log_group_name_prefixes grants logs:StartQuery/DescribeLogGroups on a
+    wildcarded ARN and has the lambda call DescribeLogGroups at invocation time
+    to resolve actual log group names, so a source can be wired up before the
+    log groups it will match exist, and picks up new ones with no redeploy.
+    log_group_names grants on exact ARNs, for log groups known at apply time.
+    At least one of the two must be set.
+  EOT
+  type = map(object({
+    log_group_names           = optional(list(string), [])
+    log_group_name_prefixes   = optional(list(string), [])
+    format                    = string
+    throw_site_package_prefix = optional(string, "")
+    extra_noise_filters       = optional(list(string), [])
+  }))
+  default = {}
+
+  validation {
+    condition     = alltrue([for s in var.log_sources : contains(["logback-json", "pino-json"], s.format)])
+    error_message = "log_sources[*].format must be \"logback-json\" or \"pino-json\"."
+  }
+
+  validation {
+    condition     = alltrue([for s in var.log_sources : length(s.log_group_names) > 0 || length(s.log_group_name_prefixes) > 0])
+    error_message = "Each log_sources entry needs at least one of log_group_names or log_group_name_prefixes."
+  }
+}
+
 variable "log_query_seconds" {
   description = "Sliding window length for the log-error scan (seconds). The EventBridge schedule rate(5 minutes) is hardcoded; the lambda's overlap and CloudWatch-indexing-delay constants assume that cadence."
   type        = number

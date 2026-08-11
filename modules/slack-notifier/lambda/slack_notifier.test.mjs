@@ -2,6 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { ssmStub } from './stub-ssm.mjs'
+import { cloudwatchLogsStub } from './stub-cloudwatch-logs.mjs'
 
 // Set AWS_REGION before importing the module to avoid side-effect issues
 // and to get deterministic URLs in buildLogInsightsUrl tests.
@@ -15,7 +16,14 @@ const {
   buildNotificationPayload,
   resolveMatchedCount,
   formatErrorCount,
-  formatRemainder
+  formatRemainder,
+  FORMAT_PRESETS,
+  EVAKA_PRESET,
+  buildQueryParts,
+  buildInsightsFields,
+  discoverLogGroupNames,
+  resolveSourceLogGroupNames,
+  deriveSourceLabel
 } = await import('./slack_notifier.mjs')
 
 // The webhook cache is module-scope state. Each caching test needs a pristine
@@ -92,6 +100,224 @@ describe('extractThrowSite', () => {
 
   it('returns null for an empty string', () => {
     assert.equal(extractThrowSite(''), null)
+  })
+
+  it('uses a custom package prefix instead of the evaka default', () => {
+    const stack = [
+      'java.lang.RuntimeException: boom',
+      '\tat evaka.core.pis.PersonService.getPerson(PersonService.kt:42)',
+      '\tat fi.espoo.vakaseteli.VoucherService.grant(VoucherService.kt:10)'
+    ].join('\n')
+    assert.equal(
+      extractThrowSite(stack, 'fi.espoo.vakaseteli'),
+      'VoucherService.grant(VoucherService.kt:10)'
+    )
+  })
+
+  it('treats dots in a custom prefix literally, not as a regex wildcard', () => {
+    const stack = '\tat fiXespooXvakaseteli.Foo.bar(Foo.kt:1)'
+    assert.equal(extractThrowSite(stack, 'fi.espoo.vakaseteli'), null)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildQueryParts
+// ---------------------------------------------------------------------------
+describe('buildQueryParts', () => {
+  const preset = FORMAT_PRESETS['logback-json']
+
+  it('filters on the preset error level, with no AsyncJobPool mute by default', () => {
+    const parts = buildQueryParts(preset, '', [])
+    assert.equal(parts[0], 'filter tolower(logLevel) = "error"')
+    assert.ok(!parts.some((p) => p.includes('AsyncJobPool')))
+  })
+
+  it('derives the AsyncJobPool mute from a throw-site package prefix', () => {
+    const parts = buildQueryParts(preset, 'fi.espoo.vakaseteli', [])
+    const muteFilter = parts.find((p) => p.includes('AsyncJobPool'))
+    assert.ok(muteFilter)
+    assert.ok(
+      muteFilter.includes(
+        'loggerName like /^fi\\.espoo\\.vakaseteli\\.shared\\.asyncjob\\.AsyncJobPool\\./'
+      )
+    )
+  })
+
+  it('appends extra noise filters verbatim', () => {
+    const parts = buildQueryParts(preset, '', [
+      'filter loggerName not like /^fi\\.espoo\\.vakaseteli\\.SESEmailClient/'
+    ])
+    assert.ok(
+      parts.includes(
+        'filter loggerName not like /^fi\\.espoo\\.vakaseteli\\.SESEmailClient/'
+      )
+    )
+  })
+
+  it('ends with a sort and a limit', () => {
+    const parts = buildQueryParts(preset, '', [])
+    assert.deepEqual(parts.slice(-2), ['sort @timestamp asc', 'limit 20'])
+  })
+
+  it('derives no AsyncJobPool mute for a format that has no such logger', () => {
+    const parts = buildQueryParts(
+      FORMAT_PRESETS['pino-json'],
+      'fi.espoo.vakaseteli',
+      []
+    )
+    assert.ok(!parts.some((p) => p.includes('AsyncJobPool')))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildInsightsFields
+// ---------------------------------------------------------------------------
+describe('buildInsightsFields', () => {
+  it('uses the logback-json field names', () => {
+    const fields = buildInsightsFields(FORMAT_PRESETS['logback-json'])
+    assert.ok(fields.includes('appName'))
+    assert.ok(fields.includes('httpMethod'))
+    assert.ok(fields.includes('logLevel'))
+  })
+
+  it('uses the pino-json field names', () => {
+    const fields = buildInsightsFields(FORMAT_PRESETS['pino-json'])
+    assert.ok(fields.includes('appName'))
+    assert.ok(fields.includes('level'))
+    assert.ok(!fields.includes('logLevel'))
+  })
+
+  // pino error entries carry no request context, so there is nothing to build a
+  // "GET /foo" endpoint out of and the logger name has to stand in for it.
+  it('falls back to the logger name as endpoint without request fields', () => {
+    const fields = buildInsightsFields(FORMAT_PRESETS['pino-json'])
+    assert.ok(fields.includes('name as endpoint'))
+    assert.ok(!fields.includes('httpMethod'))
+    assert.ok(!fields.includes('concat('))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// discoverLogGroupNames
+// ---------------------------------------------------------------------------
+describe('discoverLogGroupNames', () => {
+  beforeEach(() => {
+    cloudwatchLogsStub.reset()
+  })
+
+  it('collects log group names for a single prefix', async () => {
+    cloudwatchLogsStub.describeLogGroupsResponses = [
+      { logGroups: [{ logGroupName: '/ecs/vakaseteli-service' }] }
+    ]
+    const names = await discoverLogGroupNames(['/ecs/vakaseteli-'])
+    assert.deepEqual([...names], ['/ecs/vakaseteli-service'])
+  })
+
+  it('follows pagination via nextToken', async () => {
+    cloudwatchLogsStub.describeLogGroupsResponses = [
+      { logGroups: [{ logGroupName: '/ecs/a' }], nextToken: 'page2' },
+      { logGroups: [{ logGroupName: '/ecs/b' }] }
+    ]
+    const names = await discoverLogGroupNames(['/ecs/'])
+    assert.deepEqual([...names].sort(), ['/ecs/a', '/ecs/b'])
+  })
+
+  it('unions and dedupes results across multiple prefixes', async () => {
+    cloudwatchLogsStub.describeLogGroupsResponses = [
+      { logGroups: [{ logGroupName: '/ecs/shared' }] },
+      {
+        logGroups: [
+          { logGroupName: '/ecs/shared' },
+          { logGroupName: '/ecs/other' }
+        ]
+      }
+    ]
+    const names = await discoverLogGroupNames(['/ecs/a-', '/ecs/b-'])
+    assert.deepEqual([...names].sort(), ['/ecs/other', '/ecs/shared'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolveSourceLogGroupNames
+// ---------------------------------------------------------------------------
+describe('resolveSourceLogGroupNames', () => {
+  beforeEach(() => {
+    cloudwatchLogsStub.reset()
+  })
+
+  it('returns static names unchanged when there are no prefixes', async () => {
+    const names = await resolveSourceLogGroupNames({
+      log_group_names: ['/ecs/fixed'],
+      log_group_name_prefixes: []
+    })
+    assert.deepEqual(names, ['/ecs/fixed'])
+    assert.equal(cloudwatchLogsStub.calls.length, 0)
+  })
+
+  it('caps the list at what one query accepts, keeping the configured names', async () => {
+    const discovered = Array.from({ length: 60 }, (_, i) => ({
+      logGroupName: `/ecs/discovered-${i}`
+    }))
+    cloudwatchLogsStub.describeLogGroupsResponses = [{ logGroups: discovered }]
+
+    const names = await resolveSourceLogGroupNames({
+      log_group_names: ['/ecs/configured'],
+      log_group_name_prefixes: ['/ecs/']
+    })
+
+    assert.equal(names.length, 50)
+    assert.equal(names[0], '/ecs/configured')
+  })
+
+  it('merges discovered names with static ones, deduped', async () => {
+    cloudwatchLogsStub.describeLogGroupsResponses = [
+      {
+        logGroups: [
+          { logGroupName: '/ecs/fixed' },
+          { logGroupName: '/ecs/new-service' }
+        ]
+      }
+    ]
+    const names = await resolveSourceLogGroupNames({
+      log_group_names: ['/ecs/fixed'],
+      log_group_name_prefixes: ['/ecs/']
+    })
+    assert.deepEqual(names.sort(), ['/ecs/fixed', '/ecs/new-service'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// deriveSourceLabel
+// ---------------------------------------------------------------------------
+describe('deriveSourceLabel', () => {
+  it('prefixes the source name with the app/environment parsed off the log group', () => {
+    assert.equal(
+      deriveSourceLabel('service', [
+        '/aws/ecs/oppivelvollisuus-esc-staging/service'
+      ]),
+      'oppivelvollisuus-esc-staging/service'
+    )
+  })
+
+  it('falls back to the source name alone for a non-ECS log group name', () => {
+    assert.equal(
+      deriveSourceLabel('service', ['/ecs/oppivelvollisuus-service']),
+      'service'
+    )
+  })
+
+  it('falls back to the source name alone when several log groups resolve', () => {
+    assert.equal(
+      deriveSourceLabel('service', [
+        '/aws/ecs/oppivelvollisuus-esc-dev/service',
+        '/aws/ecs/oppivelvollisuus-esc-staging/service'
+      ]),
+      'service'
+    )
+  })
+
+  it('falls back to the source name alone with no resolved log groups', () => {
+    assert.equal(deriveSourceLabel('service', []), 'service')
   })
 })
 
@@ -561,5 +787,386 @@ describe('handleSnsRecord', () => {
 
     assert.equal(posted.length, 1)
     assert.ok(posted[0].attachments[0].blocks[0].text.text.includes(':bell:'))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// handleLogCheck
+// ---------------------------------------------------------------------------
+// The eVaka scan's query is the module's pre-log_sources behaviour, which every
+// existing eVaka environment's alerting depends on. Pinning it byte-for-byte is
+// what makes it safe to fold this path into the generalized one later.
+const EVAKA_INSIGHTS_FIELDS =
+  'fields @timestamp, appName, if(not isempty(httpMethod) and not isempty(httpRoute), concat(httpMethod, " ", httpRoute), loggerName) as endpoint, logLevel, message, stackTrace'
+
+const EVAKA_QUERY = [
+  'fields @timestamp, @message',
+  'filter tolower(logLevel) = "error"',
+  'filter not (loggerName like /^evaka\\.core\\.shared\\.async\\.AsyncJobPool\\./ and meta.remainingAttempts > 0)',
+  'filter loggerName not like /^evaka\\.core\\.varda\\./',
+  'filter not (exception = "UnableToExecuteStatementException" and (message like /staff_attendance_no_overlaps/ or message like /staff_attendance_plan_no_overlaps/))',
+  'sort @timestamp asc',
+  'limit 20'
+].join('\n| ')
+
+describe('handleLogCheck', () => {
+  let originalLog
+
+  beforeEach(() => {
+    originalLog = console.log
+    console.log = () => {}
+    ssmStub.reset()
+    cloudwatchLogsStub.reset()
+  })
+
+  afterEach(() => {
+    console.log = originalLog
+    delete process.env.LOG_GROUP_NAMES
+  })
+
+  it('queries the configured log groups with the eVaka query verbatim', async () => {
+    process.env.LOG_GROUP_NAMES = '/aws/ecs/evaka-service,/aws/ecs/evaka-apigw'
+    const { handleLogCheck } = await freshModule()
+
+    await handleLogCheck('aws')
+
+    const startQueryCall = cloudwatchLogsStub.calls.find(
+      (c) => c.constructor.name === 'StartQueryCommand'
+    )
+    assert.equal(startQueryCall.input.queryString, EVAKA_QUERY)
+    assert.deepEqual(startQueryCall.input.logGroupNames, [
+      '/aws/ecs/evaka-service',
+      '/aws/ecs/evaka-apigw'
+    ])
+  })
+
+  // The deep-link query is the other half of the pinned behaviour: it selects
+  // httpRoute where the Slack lines use path, and both fields really exist.
+  it('builds the eVaka deep-link fields verbatim', () => {
+    assert.equal(buildInsightsFields(EVAKA_PRESET), EVAKA_INSIGHTS_FIELDS)
+  })
+
+  it('does not query at all without configured log groups', async () => {
+    const { handleLogCheck } = await freshModule()
+
+    await handleLogCheck('aws')
+
+    assert.equal(cloudwatchLogsStub.calls.length, 0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// handleLogSourceCheck
+// ---------------------------------------------------------------------------
+describe('handleLogSourceCheck', () => {
+  let originalFetch
+  let originalLog
+  let posted
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+    originalLog = console.log
+    console.log = () => {}
+    posted = []
+    globalThis.fetch = async (_url, init) => {
+      posted.push(JSON.parse(init.body))
+      return { ok: true, status: 200 }
+    }
+    ssmStub.reset()
+    cloudwatchLogsStub.reset()
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    console.log = originalLog
+  })
+
+  it('parses a logback-json source with its own field names and package prefix', async () => {
+    const { handleLogSourceCheck } = await freshModule()
+    const logLine = JSON.stringify({
+      loggerName: 'fi.espoo.oppivelvollisuus.SomeService',
+      logLevel: 'ERROR',
+      message: 'Something broke',
+      exception: 'java.lang.RuntimeException',
+      stackTrace:
+        'java.lang.RuntimeException: boom\n\tat fi.espoo.oppivelvollisuus.SomeService.doThing(SomeService.kt:10)',
+      httpMethod: 'GET',
+      path: '/api/foo',
+      traceId: 'abc123'
+    })
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      {
+        status: 'Complete',
+        results: [
+          [
+            { field: '@timestamp', value: '2024-01-15T14:30:00Z' },
+            { field: '@message', value: logLine }
+          ]
+        ],
+        statistics: { recordsMatched: 1 }
+      }
+    ]
+
+    await handleLogSourceCheck(
+      'service',
+      {
+        log_group_names: ['/ecs/oppivelvollisuus-service'],
+        log_group_name_prefixes: [],
+        format: 'logback-json',
+        throw_site_package_prefix: 'fi.espoo.oppivelvollisuus',
+        extra_noise_filters: []
+      },
+      'aws'
+    )
+
+    assert.equal(posted.length, 1)
+    const text = posted[0].attachments[0].blocks
+      .map((b) => b.text.text)
+      .join('\n')
+    assert.ok(text.includes('[service]'))
+    assert.ok(text.includes('GET /api/foo'))
+    assert.ok(text.includes('SomeService'))
+    assert.ok(text.includes('SomeService.doThing(SomeService.kt:10)'))
+
+    const startQueryCall = cloudwatchLogsStub.calls.find(
+      (c) => c.constructor.name === 'StartQueryCommand'
+    )
+    assert.ok(
+      startQueryCall.input.queryString.includes(
+        'loggerName like /^fi\\.espoo\\.oppivelvollisuus\\.shared\\.asyncjob\\.AsyncJobPool\\./'
+      )
+    )
+  })
+
+  it('labels the message with the app/environment when the log group follows the ECS convention', async () => {
+    const { handleLogSourceCheck } = await freshModule()
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      {
+        status: 'Complete',
+        results: [
+          [
+            { field: '@timestamp', value: '2024-01-15T14:30:00Z' },
+            { field: '@message', value: JSON.stringify({ message: 'boom' }) }
+          ]
+        ],
+        statistics: { recordsMatched: 1 }
+      }
+    ]
+
+    await handleLogSourceCheck(
+      'service',
+      {
+        log_group_names: ['/aws/ecs/oppivelvollisuus-esc-staging/service'],
+        log_group_name_prefixes: [],
+        format: 'logback-json',
+        throw_site_package_prefix: 'fi.espoo.oppivelvollisuus',
+        extra_noise_filters: []
+      },
+      'aws'
+    )
+
+    assert.equal(posted.length, 1)
+    const header = posted[0].attachments[0].blocks[0].text.text
+    assert.ok(header.includes('[oppivelvollisuus-esc-staging/service]'))
+  })
+
+  it('parses a pino-json source using level/name instead of logLevel/loggerName', async () => {
+    const { handleLogSourceCheck } = await freshModule()
+    // Shaped after a real api-gateway error entry: pino's own `name`/`level`,
+    // an appName from the logger's base fields, and no request context.
+    const logLine = JSON.stringify({
+      name: 'app',
+      appName: 'oppivelvollisuus-api-gateway',
+      level: 'error',
+      message: 'Boom',
+      exception: 'Error',
+      stackTrace: 'Error: Boom\n    at handler (index.js:5:3)',
+      traceId: 'abcdef'
+    })
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      {
+        status: 'Complete',
+        results: [
+          [
+            { field: '@timestamp', value: '2024-01-15T14:30:00Z' },
+            { field: '@message', value: logLine }
+          ]
+        ],
+        statistics: { recordsMatched: 1 }
+      }
+    ]
+
+    await handleLogSourceCheck(
+      'api-gateway',
+      {
+        log_group_names: ['/ecs/api-gateway'],
+        log_group_name_prefixes: [],
+        format: 'pino-json',
+        throw_site_package_prefix: '',
+        extra_noise_filters: []
+      },
+      'aws'
+    )
+
+    assert.equal(posted.length, 1)
+    const text = posted[0].attachments[0].blocks
+      .map((b) => b.text.text)
+      .join('\n')
+    assert.ok(text.includes('Error: Boom'))
+    // No throw-site prefix configured: no stack-frame line is extracted.
+    assert.ok(!text.includes('index.js'))
+
+    const startQueryCall = cloudwatchLogsStub.calls.find(
+      (c) => c.constructor.name === 'StartQueryCommand'
+    )
+    assert.ok(startQueryCall.input.queryString.includes('tolower(level)'))
+    assert.ok(!startQueryCall.input.queryString.includes('AsyncJobPool'))
+  })
+
+  it('discovers log groups from a prefix before querying', async () => {
+    const { handleLogSourceCheck } = await freshModule()
+    cloudwatchLogsStub.describeLogGroupsResponses = [
+      { logGroups: [{ logGroupName: '/ecs/vakaseteli-service' }] }
+    ]
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      { status: 'Complete', results: [], statistics: { recordsMatched: 0 } }
+    ]
+
+    await handleLogSourceCheck(
+      'service',
+      {
+        log_group_names: [],
+        log_group_name_prefixes: ['/ecs/vakaseteli-'],
+        format: 'logback-json',
+        throw_site_package_prefix: '',
+        extra_noise_filters: []
+      },
+      'aws'
+    )
+
+    const startQueryCall = cloudwatchLogsStub.calls.find(
+      (c) => c.constructor.name === 'StartQueryCommand'
+    )
+    assert.deepEqual(startQueryCall.input.logGroupNames, [
+      '/ecs/vakaseteli-service'
+    ])
+  })
+
+  it('skips the scan without querying when no log groups resolve', async () => {
+    const { handleLogSourceCheck } = await freshModule()
+
+    await handleLogSourceCheck(
+      'service',
+      {
+        log_group_names: [],
+        log_group_name_prefixes: [],
+        format: 'logback-json',
+        throw_site_package_prefix: '',
+        extra_noise_filters: []
+      },
+      'aws'
+    )
+
+    assert.equal(cloudwatchLogsStub.calls.length, 0)
+    assert.equal(posted.length, 0)
+  })
+
+  it('warns on Slack when the query never completes', async () => {
+    const { handleLogSourceCheck } = await freshModule()
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      { status: 'Failed', results: null, statistics: null }
+    ]
+
+    await handleLogSourceCheck(
+      'service',
+      {
+        log_group_names: ['/ecs/service'],
+        log_group_name_prefixes: [],
+        format: 'logback-json',
+        throw_site_package_prefix: '',
+        extra_noise_filters: []
+      },
+      'aws'
+    )
+
+    assert.equal(posted.length, 1)
+    const text = posted[0].attachments[0].blocks[0].text.text
+    assert.ok(text.includes('log error query for "service" failed'))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// handler (scheduled scan fan-out)
+// ---------------------------------------------------------------------------
+describe('handler on a scheduled event', () => {
+  let originalFetch
+  let originalLog
+  let originalError
+  let posted
+
+  const context = {
+    invokedFunctionArn:
+      'arn:aws:lambda:eu-west-1:123456789012:function:test-slack-notifier'
+  }
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+    originalLog = console.log
+    originalError = console.error
+    console.log = () => {}
+    console.error = () => {}
+    posted = []
+    globalThis.fetch = async (_url, init) => {
+      posted.push(JSON.parse(init.body))
+      return { ok: true, status: 200 }
+    }
+    ssmStub.reset()
+    cloudwatchLogsStub.reset()
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    console.log = originalLog
+    console.error = originalError
+    delete process.env.LOG_GROUP_NAMES
+    delete process.env.LOG_SOURCES_JSON
+  })
+
+  // A source whose log groups cannot even be listed used to be indistinguishable
+  // in Slack from one that found no errors.
+  it('warns about a log source that cannot be run, without skipping the others', async () => {
+    process.env.LOG_GROUP_NAMES = '/aws/ecs/evaka-service'
+    process.env.LOG_SOURCES_JSON = JSON.stringify({
+      service: {
+        log_group_names: [],
+        log_group_name_prefixes: ['/ecs/oppivelvollisuus-'],
+        format: 'logback-json',
+        throw_site_package_prefix: '',
+        extra_noise_filters: []
+      }
+    })
+    const { handler } = await freshModule()
+    // No DescribeLogGroups response queued: the stub rejects, as a denied
+    // listing would.
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      { status: 'Complete', results: [], statistics: null }
+    ]
+
+    await handler({ source: 'aws.events' }, context)
+
+    const commands = cloudwatchLogsStub.calls.map((c) => c.constructor.name)
+    assert.ok(commands.includes('DescribeLogGroupsCommand'))
+    assert.equal(
+      commands.filter((n) => n === 'StartQueryCommand').length,
+      1,
+      'the eVaka scan should still have run its own query'
+    )
+
+    assert.equal(posted.length, 1)
+    assert.ok(
+      posted[0].attachments[0].blocks[0].text.text.includes(
+        'log source "service" could not be run:'
+      )
+    )
   })
 })
