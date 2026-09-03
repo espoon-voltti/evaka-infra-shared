@@ -324,6 +324,15 @@ async function resolveSourceLogGroupNames(source) {
   return resolved.slice(0, MAX_QUERY_LOG_GROUPS)
 }
 
+async function reportScanFailure(label, err) {
+  console.error(`Failed to run ${label}:`, err)
+  try {
+    await warnSlack(`${label} could not be run: ${err.message ?? err}`)
+  } catch (warnErr) {
+    console.error(`Failed to warn Slack about ${label}:`, warnErr)
+  }
+}
+
 // A scan that cannot run at all — a denied DescribeLogGroups, too many log
 // groups for one query — otherwise looks exactly like a scan that found nothing,
 // so it is reported the same way a query that never completes is.
@@ -331,12 +340,7 @@ async function runScan(label, scan) {
   try {
     await scan()
   } catch (err) {
-    console.error(`Failed to run ${label}:`, err)
-    try {
-      await warnSlack(`${label} could not be run: ${err.message ?? err}`)
-    } catch (warnErr) {
-      console.error(`Failed to warn Slack about ${label}:`, warnErr)
-    }
+    await reportScanFailure(label, err)
   }
 }
 
@@ -372,6 +376,12 @@ function deriveSourceLabel(sourceName, logGroupNames) {
   return sourceName
 }
 
+// The scan itself is caught here rather than left to the caller's runScan, so a
+// query failure is reported under the environment-qualified label instead of
+// the bare source name that is all runScan's caller has to go on. Resolving
+// the log groups can still fail before any label can be derived; that case is
+// left to propagate to the caller's runScan, which reports it under the bare
+// source name.
 async function handleLogSourceCheck(sourceName, source, partition) {
   const logGroupNames = await resolveSourceLogGroupNames(source)
   if (logGroupNames.length === 0) {
@@ -379,19 +389,24 @@ async function handleLogSourceCheck(sourceName, source, partition) {
     return
   }
 
+  const label = deriveSourceLabel(sourceName, logGroupNames)
   const preset = FORMAT_PRESETS[source.format]
-  await runLogScan({
-    label: deriveSourceLabel(sourceName, logGroupNames),
-    logGroupNames,
-    preset,
-    queryParts: buildQueryParts(
+  try {
+    await runLogScan({
+      label,
+      logGroupNames,
       preset,
-      source.throw_site_package_prefix,
-      source.extra_noise_filters
-    ),
-    throwSitePackagePrefix: source.throw_site_package_prefix,
-    partition
-  })
+      queryParts: buildQueryParts(
+        preset,
+        source.throw_site_package_prefix,
+        source.extra_noise_filters
+      ),
+      throwSitePackagePrefix: source.throw_site_package_prefix,
+      partition
+    })
+  } catch (err) {
+    await reportScanFailure(`log source "${label}"`, err)
+  }
 }
 
 // An empty label is the eVaka scan, whose Slack and log strings predate

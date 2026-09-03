@@ -5,6 +5,7 @@
 export const cloudwatchLogsStub = {
   describeLogGroupsResponses: [],
   startQueryResponse: { queryId: 'stub-query-id' },
+  startQueryError: null,
   getQueryResultsResponses: [
     { status: 'Complete', results: [], statistics: null }
   ],
@@ -12,6 +13,7 @@ export const cloudwatchLogsStub = {
   reset() {
     this.describeLogGroupsResponses = []
     this.startQueryResponse = { queryId: 'stub-query-id' }
+    this.startQueryError = null
     this.getQueryResultsResponses = [
       { status: 'Complete', results: [], statistics: null }
     ]
@@ -36,6 +38,9 @@ export class CloudWatchLogsClient {
     }
 
     if (command instanceof StartQueryCommand) {
+      if (cloudwatchLogsStub.startQueryError) {
+        throw cloudwatchLogsStub.startQueryError
+      }
       return cloudwatchLogsStub.startQueryResponse
     }
 

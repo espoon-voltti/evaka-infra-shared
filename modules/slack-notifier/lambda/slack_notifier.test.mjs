@@ -1169,4 +1169,33 @@ describe('handler on a scheduled event', () => {
       )
     )
   })
+
+  // A query rejected after the log groups resolved (e.g. a bad time range)
+  // used to report only the bare source name, indistinguishable in a
+  // shared Slack channel from the same source failing in another environment.
+  it('warns about a failed query under the environment-qualified label', async () => {
+    process.env.LOG_SOURCES_JSON = JSON.stringify({
+      service: {
+        log_group_names: ['/aws/ecs/oppivelvollisuus-esc-staging/service'],
+        log_group_name_prefixes: [],
+        format: 'logback-json',
+        throw_site_package_prefix: '',
+        extra_noise_filters: []
+      }
+    })
+    cloudwatchLogsStub.startQueryError = new Error(
+      "Query's end date and time is either before the log groups creation " +
+        'time or exceeds the log groups log retention settings ([0,91])'
+    )
+    const { handler } = await freshModule()
+
+    await handler({ source: 'aws.events' }, context)
+
+    assert.equal(posted.length, 1)
+    assert.ok(
+      posted[0].attachments[0].blocks[0].text.text.includes(
+        'log source "oppivelvollisuus-esc-staging/service" could not be run:'
+      )
+    )
+  })
 })
