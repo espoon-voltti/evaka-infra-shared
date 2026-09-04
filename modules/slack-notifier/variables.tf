@@ -25,6 +25,12 @@ variable "slack_channel" {
   default     = null
 }
 
+variable "slack_username" {
+  description = "Sender name shown on the Slack messages, overriding the webhook's own default. Set to null to keep the webhook's own name instead. Honored only by legacy incoming webhooks (the same ones slack_channel needs)."
+  type        = string
+  default     = "Alert System"
+}
+
 variable "slack_webhook_kms_arn" {
   description = "KMS key ARN for SSM decrypt. Empty means the SSM parameter is encrypted with the AWS-managed aws/ssm key, in which case no kms:Decrypt grant is created."
   type        = string
@@ -68,8 +74,8 @@ variable "log_sources" {
   default = {}
 
   validation {
-    condition     = alltrue([for s in var.log_sources : contains(["logback-json", "pino-json"], s.format)])
-    error_message = "log_sources[*].format must be \"logback-json\" or \"pino-json\"."
+    condition     = alltrue([for s in var.log_sources : contains(["logback-json", "pino-json", "ssm-session-audit"], s.format)])
+    error_message = "log_sources[*].format must be \"logback-json\", \"pino-json\" or \"ssm-session-audit\"."
   }
 
   validation {

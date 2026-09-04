@@ -14,6 +14,7 @@ const {
   buildLogInsightsUrl,
   buildAlarmPayload,
   buildNotificationPayload,
+  buildSessionDigestPayload,
   resolveMatchedCount,
   formatErrorCount,
   formatRemainder,
@@ -26,11 +27,16 @@ const {
   deriveSourceLabel
 } = await import('./slack_notifier.mjs')
 
-// The webhook cache is module-scope state. Each caching test needs a pristine
-// module instance; a unique query string forces a fresh evaluation.
+// The webhook cache is module-scope state in lib.mjs. Each caching test needs a
+// pristine instance; a unique query string forces a fresh evaluation. postToSlack
+// and getSlackWebhookUrl live in lib, so their caching tests re-import lib; the
+// rest re-import the entry.
 let moduleLoadCount = 0
 function freshModule() {
   return import(`./slack_notifier.mjs?case=${moduleLoadCount++}`)
+}
+function freshLib() {
+  return import(`./lib.mjs?case=${moduleLoadCount++}`)
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +543,7 @@ describe('postToSlack webhook caching', () => {
   })
 
   it('does not cache the URL when fetch rejects', async () => {
-    const { postToSlack } = await freshModule()
+    const { postToSlack } = await freshLib()
     ssmStub.parameterValue = 'changeit'
     globalThis.fetch = async () => {
       // An invalid URL makes fetch reject before returning a response — the
@@ -552,7 +558,7 @@ describe('postToSlack webhook caching', () => {
   })
 
   it('does not cache the URL on a non-2xx Slack response', async () => {
-    const { postToSlack } = await freshModule()
+    const { postToSlack } = await freshLib()
     ssmStub.parameterValue = 'https://hooks.slack.com/services/REVOKED'
     globalThis.fetch = async () => ({
       ok: false,
@@ -567,7 +573,7 @@ describe('postToSlack webhook caching', () => {
   })
 
   it('caches the URL after a successful POST and reuses it', async () => {
-    const { postToSlack } = await freshModule()
+    const { postToSlack } = await freshLib()
     ssmStub.parameterValue = 'https://hooks.slack.com/services/OK'
     globalThis.fetch = async () => ({ ok: true, status: 200 })
 
@@ -578,7 +584,7 @@ describe('postToSlack webhook caching', () => {
   })
 
   it('recovers without a restart after the SSM value is fixed', async () => {
-    const { postToSlack } = await freshModule()
+    const { postToSlack } = await freshLib()
     ssmStub.parameterValue = 'changeit'
     globalThis.fetch = async (url) => {
       if (url === 'changeit') throw new TypeError('Failed to parse URL')
@@ -603,7 +609,7 @@ describe('getSlackWebhookUrl', () => {
   })
 
   it('reads SSM every call and never caches on its own', async () => {
-    const { getSlackWebhookUrl } = await freshModule()
+    const { getSlackWebhookUrl } = await freshLib()
     ssmStub.parameterValue = 'https://hooks.slack.com/services/OK'
 
     assert.equal(
@@ -673,6 +679,49 @@ describe('formatRemainder', () => {
 // ---------------------------------------------------------------------------
 // buildNotificationPayload
 // ---------------------------------------------------------------------------
+describe('buildSessionDigestPayload', () => {
+  const row = (arn, target, sessions) => [
+    { field: 'detail.userIdentity.arn', value: arn },
+    { field: 'detail.requestParameters.target', value: target },
+    { field: 'sessions', value: String(sessions) }
+  ]
+
+  it('groups sessions per user and target with a total', () => {
+    const payload = buildSessionDigestPayload(
+      [
+        row(
+          'arn:aws:sts::123:assumed-role/AWSReservedSSO_Admin/EXT-test.user@example.com',
+          'i-abc',
+          3
+        ),
+        row('arn:aws:sts::123:assumed-role/Reader/reader@example.com', 'i-def', 1)
+      ],
+      ''
+    )
+    const blocks = payload.attachments[0].blocks
+    assert.match(blocks[0].text.text, /:bell: \*4 SSM sessions started\*/)
+    assert.equal(
+      blocks[1].text.text,
+      '• EXT-test.user@example.com (3) on i-abc\n• reader@example.com (1) on i-def'
+    )
+  })
+
+  it('uses the singular form for one session and prefixes a label', () => {
+    const payload = buildSessionDigestPayload(
+      [row('root', 'i-abc', 1)],
+      'evaka-prod'
+    )
+    assert.match(
+      payload.attachments[0].blocks[0].text.text,
+      /:bell: \*\[evaka-prod\] 1 SSM session started\*/
+    )
+    assert.equal(
+      payload.attachments[0].blocks[1].text.text,
+      '• root (1) on i-abc'
+    )
+  })
+})
+
 describe('buildNotificationPayload', () => {
   it('renders a subject as the headline and the text below it', () => {
     const payload = buildNotificationPayload(
@@ -1197,5 +1246,32 @@ describe('handler on a scheduled event', () => {
         'log source "oppivelvollisuus-esc-staging/service" could not be run:'
       )
     )
+  })
+
+  // A log group younger than the query window (just applied) makes StartQuery
+  // reject the query outright. That window holds no data, so it must be silent,
+  // not a page in every account for the first few minutes after rollout.
+  it('stays silent when the log group is too new for the query window', async () => {
+    process.env.LOG_SOURCES_JSON = JSON.stringify({
+      'ssm-sessions': {
+        log_group_names: ['/aws/events/voltti-session-manager-ssm-sessions'],
+        log_group_name_prefixes: [],
+        format: 'ssm-session-audit',
+        throw_site_package_prefix: '',
+        extra_noise_filters: []
+      }
+    })
+    cloudwatchLogsStub.startQueryError = Object.assign(
+      new Error(
+        "Query's end date and time is either before the log groups creation " +
+          'time or exceeds the log groups log retention settings ([0,93])'
+      ),
+      { name: 'MalformedQueryException' }
+    )
+    const { handler } = await freshModule()
+
+    await handler({ source: 'aws.events' }, context)
+
+    assert.equal(posted.length, 0)
   })
 })

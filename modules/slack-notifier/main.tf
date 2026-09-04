@@ -94,10 +94,21 @@ locals {
   metric_alarms = merge(local.backup_failed_alarm, var.metric_alarms)
 }
 
+# The lambda is split into an entry point, shared lib, and one file per check /
+# message handler, so zip the whole dir. Tests, stubs and the build artifact
+# itself are excluded; the zip is written outside the source dir to avoid
+# packaging its own output.
 data "archive_file" "slack_notifier" {
   type        = "zip"
-  source_file = "${path.module}/lambda/slack_notifier.mjs"
-  output_path = "${path.module}/lambda/slack_notifier.zip"
+  source_dir  = "${path.module}/lambda"
+  output_path = "${path.module}/slack_notifier.zip"
+  excludes = [
+    "slack_notifier.test.mjs",
+    "stub-ssm.mjs",
+    "stub-cloudwatch-logs.mjs",
+    "mock-aws-loader.mjs",
+    "slack_notifier.zip"
+  ]
 }
 
 resource "aws_iam_role" "slack_notifier" {
@@ -146,6 +157,7 @@ resource "aws_lambda_function" "slack_notifier" {
     variables = {
       SLACK_WEBHOOK_SSM_NAME = var.slack_webhook_ssm_name
       SLACK_CHANNEL          = var.slack_channel != null ? var.slack_channel : ""
+      SLACK_USERNAME         = var.slack_username != null ? var.slack_username : ""
       LOG_GROUP_NAMES        = join(",", var.log_group_names)
       LOG_QUERY_SECONDS      = tostring(var.log_query_seconds)
       LOG_SOURCES_JSON       = jsonencode(var.log_sources)
