@@ -87,7 +87,7 @@ recover from.
 ```hcl
 module "waf" {
   count  = var.alb_enabled && var.waf_enabled ? 1 : 0
-  source = "git::https://github.com/espoon-voltti/evaka-infra-shared.git//modules/waf?ref=v11&depth=1"
+  source = "git::https://github.com/espoon-voltti/evaka-infra-shared.git//modules/waf?ref=v12&depth=1"
 
   name_prefix = "${var.project}-${var.environment}"
   alb_arn     = module.ecs.public_alb_arn
