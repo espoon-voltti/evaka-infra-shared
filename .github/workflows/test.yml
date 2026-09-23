@@ -19,6 +19,9 @@ jobs:
 
   terraform:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [slack-notifier, waf]
     steps:
       - uses: actions/checkout@v7
       - uses: hashicorp/setup-terraform@v4
@@ -27,7 +30,7 @@ jobs:
       - name: terraform fmt
         run: terraform fmt -check -recursive modules/
       - name: terraform validate
-        working-directory: modules/slack-notifier
+        working-directory: modules/${{ matrix.module }}
         run: |
           terraform init -backend=false
           terraform validate
