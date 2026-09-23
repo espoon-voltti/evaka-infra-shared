@@ -13,8 +13,8 @@ import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm'
 
 export const REGION = process.env.AWS_REGION ?? 'eu-west-1'
 
-// The overlap and indexing-delay assume the EventBridge schedule's rate(5
-// minutes) cadence, same as LOG_QUERY_SECONDS's default.
+// The overlap and indexing-delay assume the EventBridge schedule's 5-minute
+// cadence, same as LOG_QUERY_SECONDS's default.
 export const LOG_QUERY_SECONDS = parseInt(
   process.env.LOG_QUERY_SECONDS ?? '300',
   10
@@ -22,10 +22,16 @@ export const LOG_QUERY_SECONDS = parseInt(
 export const OVERLAP_SECONDS = 10
 export const CLOUDWATCH_INDEXING_DELAY_SECONDS = 5 * 60
 
-// Delays (ms) before each GetQueryResults poll: fast initial checks, max ~10s.
-export const POLL_DELAYS_MS = [
-  0, 100, 200, 400, 800, 1200, 1500, 1800, 2000, 2000
-]
+// Logs Insights sometimes keeps a query Scheduled for over 20 s before running
+// it, so a check keeps polling this long before reporting the query as failed.
+// It must stay well under the lambda timeout in main.tf: an invocation killed
+// while a scan is still polling cannot warn Slack at all.
+export const QUERY_DEADLINE_MS = 40_000
+
+// Delays (ms) before successive GetQueryResults polls: quick at first, since
+// most queries finish in under a second, then POLL_INTERVAL_MS apart.
+const POLL_BACKOFF_MS = [0, 100, 200, 400, 800, 1200, 1500, 1800]
+const POLL_INTERVAL_MS = 2000
 
 // CloudWatch Logs Insights rejects a query naming more than this many log groups.
 export const MAX_QUERY_LOG_GROUPS = 50
@@ -181,7 +187,8 @@ export async function runInsightsQuery(
   logGroupNames,
   queryString,
   startTime,
-  endTime
+  endTime,
+  { deadlineMs = QUERY_DEADLINE_MS } = {}
 ) {
   let queryId
   try {
@@ -208,7 +215,9 @@ export async function runInsightsQuery(
   let lastStatus = 'Running'
   let attempts = 0
   const pollStartMs = Date.now()
-  for (const delayMs of POLL_DELAYS_MS) {
+  for (;;) {
+    const delayMs = POLL_BACKOFF_MS[attempts] ?? POLL_INTERVAL_MS
+    if (Date.now() - pollStartMs + delayMs > deadlineMs) break
     if (delayMs > 0) await sleep(delayMs)
     attempts++
     const response = await logsClient.send(

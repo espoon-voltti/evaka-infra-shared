@@ -85,7 +85,7 @@ variable "log_sources" {
 }
 
 variable "log_query_seconds" {
-  description = "Sliding window length for the log-error scan (seconds). The EventBridge schedule rate(5 minutes) is hardcoded; the lambda's overlap and CloudWatch-indexing-delay constants assume that cadence."
+  description = "Sliding window length for the log-error scan (seconds). The 5-minute EventBridge schedule is hardcoded; the lambda's overlap and CloudWatch-indexing-delay constants assume that cadence."
   type        = number
   default     = 300
 }

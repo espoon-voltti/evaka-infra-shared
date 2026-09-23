@@ -149,7 +149,7 @@ resource "aws_lambda_function" "slack_notifier" {
   role             = aws_iam_role.slack_notifier.arn
   handler          = "slack_notifier.handler"
   runtime          = "nodejs24.x"
-  timeout          = 30
+  timeout          = 60 # Must exceed QUERY_DEADLINE_MS in lambda/lib.mjs.
   filename         = data.archive_file.slack_notifier.output_path
   source_code_hash = data.archive_file.slack_notifier.output_base64sha256
 
@@ -212,13 +212,15 @@ resource "aws_cloudwatch_metric_alarm" "metric_alarm" {
   }
 }
 
-# EventBridge schedule: check logs every 5 minutes
+# EventBridge schedule: check logs every 5 minutes, at minutes 2, 7, ... 57. No
+# run starts in an hour's first two minutes, when Logs Insights sometimes keeps a
+# query Scheduled for longer than the lambda polls it.
 resource "aws_cloudwatch_event_rule" "log_error_check" {
   count = local.log_scan_enabled ? 1 : 0
 
   name                = local.rule_name
   description         = "Check for service errors in logs every 5 minutes"
-  schedule_expression = "rate(5 minutes)"
+  schedule_expression = "cron(2/5 * * * ? *)"
 }
 
 resource "aws_cloudwatch_event_target" "log_error_check" {

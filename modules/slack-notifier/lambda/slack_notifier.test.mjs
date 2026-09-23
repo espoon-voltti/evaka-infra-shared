@@ -905,6 +905,57 @@ describe('handleLogCheck', () => {
 })
 
 // ---------------------------------------------------------------------------
+// runInsightsQuery
+// ---------------------------------------------------------------------------
+describe('runInsightsQuery', () => {
+  beforeEach(() => {
+    cloudwatchLogsStub.reset()
+  })
+
+  // Logs Insights sometimes holds a query in Scheduled for tens of seconds
+  // before it runs; that is a slow query, not a failed one.
+  it('keeps polling a query that is still Scheduled or Running', async () => {
+    const { runInsightsQuery } = await freshLib()
+    const rows = [[{ field: '@message', value: 'boom' }]]
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      { status: 'Scheduled' },
+      { status: 'Scheduled' },
+      { status: 'Running' },
+      { status: 'Complete', results: rows, statistics: null }
+    ]
+
+    const outcome = await runInsightsQuery(['/ecs/service'], 'q', 0, 1)
+
+    assert.deepEqual(outcome.results, rows)
+    assert.equal(
+      cloudwatchLogsStub.calls.filter(
+        (c) => c.constructor.name === 'GetQueryResultsCommand'
+      ).length,
+      4
+    )
+  })
+
+  it('stops at the deadline and reports how far it got', async () => {
+    const { runInsightsQuery } = await freshLib()
+    cloudwatchLogsStub.getQueryResultsResponses = Array.from(
+      { length: 20 },
+      () => ({ status: 'Scheduled' })
+    )
+
+    const outcome = await runInsightsQuery(['/ecs/service'], 'q', 0, 1, {
+      deadlineMs: 500
+    })
+
+    assert.equal(outcome.results, null)
+    assert.equal(outcome.lastStatus, 'Scheduled')
+    // Polls at about 0, 100 and 300 ms; the next backoff step would end past
+    // the deadline, so it is not taken.
+    assert.equal(outcome.attempts, 3)
+    assert.ok(outcome.elapsedMs <= 500, `elapsed ${outcome.elapsedMs}ms`)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // handleLogSourceCheck
 // ---------------------------------------------------------------------------
 describe('handleLogSourceCheck', () => {
@@ -1245,6 +1296,38 @@ describe('handler on a scheduled event', () => {
       posted[0].attachments[0].blocks[0].text.text.includes(
         'log source "oppivelvollisuus-esc-staging/service" could not be run:'
       )
+    )
+  })
+
+  // The warning used to carry only the last status, so a query AWS kept queued
+  // could not be told apart from one abandoned after a single poll.
+  it('warns about a failed SSM session audit with how long it polled', async () => {
+    process.env.LOG_SOURCES_JSON = JSON.stringify({
+      'ssm-sessions': {
+        log_group_names: ['/aws/events/voltti-session-manager-ssm-sessions'],
+        log_group_name_prefixes: [],
+        format: 'ssm-session-audit',
+        throw_site_package_prefix: '',
+        extra_noise_filters: []
+      }
+    })
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      { status: 'Failed', results: null, statistics: null }
+    ]
+    const originalWarn = console.warn
+    console.warn = () => {}
+    const { handler } = await freshModule()
+
+    try {
+      await handler({ source: 'aws.events' }, context)
+    } finally {
+      console.warn = originalWarn
+    }
+
+    assert.equal(posted.length, 1)
+    assert.match(
+      posted[0].attachments[0].blocks[0].text.text,
+      /SSM session audit for "ssm-sessions" failed after 1 attempts in \d+ms \(last status: Failed\)/
     )
   })
 

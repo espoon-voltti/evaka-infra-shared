@@ -48,9 +48,9 @@ export async function handler(event, context) {
       }
     }
   } else if (event.source === 'aws.events') {
-    // Concurrently: each scan polls its query for up to ~10s, which sequentially
-    // would run several scans past the lambda's timeout — and a timed-out
-    // invocation cannot report anything to Slack.
+    // Concurrently: each scan polls its query for up to QUERY_DEADLINE_MS, which
+    // sequentially would run several scans past the lambda's timeout, and a
+    // timed-out invocation cannot report anything to Slack.
     await Promise.all([
       runScan('the eVaka log scan', () => handleLogCheck(partition)),
       ...Object.entries(LOG_SOURCES).map(([name, source]) =>

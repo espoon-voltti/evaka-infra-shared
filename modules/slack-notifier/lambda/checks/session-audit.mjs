@@ -64,7 +64,7 @@ async function run(sourceName, source, logGroupNames, partition) {
   const scanName = label ? ` for "${label}"` : ''
 
   const { startTime, endTime } = defaultQueryWindow()
-  const { results, lastStatus } = await runInsightsQuery(
+  const { results, lastStatus, attempts, elapsedMs } = await runInsightsQuery(
     logGroupNames,
     QUERY,
     startTime,
@@ -72,9 +72,9 @@ async function run(sourceName, source, logGroupNames, partition) {
   )
 
   if (results === null) {
-    await warnSlack(
-      `SSM session audit${scanName} failed — last status: ${lastStatus}`
-    )
+    const failure = `SSM session audit${scanName} failed after ${attempts} attempts in ${elapsedMs}ms (last status: ${lastStatus})`
+    console.warn(failure)
+    await warnSlack(failure)
     return
   }
   if (results.length === 0) return
