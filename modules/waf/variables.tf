@@ -20,8 +20,8 @@ variable "enforce" {
     per environment, then flip. The flip is an in-place web ACL update; it also
     retargets the rate-limit alarms from CountedRequests to CaptchaRequests.
 
-    The basic-auth exception rule is an ALLOW either way — it exempts traffic
-    rather than acting on it.
+    The basic-auth and path exception rules are ALLOWs either way — they exempt
+    traffic rather than acting on it.
   EOT
   type        = bool
   default     = false
@@ -93,6 +93,28 @@ variable "basic_auth_exception" {
   validation {
     condition     = var.basic_auth_exception == null || can(regex("^[A-Za-z0-9+/]+={0,2}$", var.basic_auth_exception))
     error_message = "basic_auth_exception must be the base64 encoding of \"user:password\", not the raw credentials."
+  }
+}
+
+variable "exception_paths" {
+  description = <<-EOT
+    URL paths whose requests are allowed without evaluating any other rule, each
+    together with everything beneath it: "/api/mcp" matches "/api/mcp" and
+    "/api/mcp/oauth/token" but not "/api/mcpx". The path is compared after URL
+    decoding and dot-segment removal, so "/api/mcp/../employee" does not match.
+
+    Requests to these paths are neither rate limited, geo fenced nor inspected
+    by the managed rule groups, so this is for test environments only: e.g. an
+    MCP server called by cloud-hosted AI agents from outside allowed_countries,
+    through egress addresses shared by many agents. Empty (the default) creates
+    no such rule.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for path in var.exception_paths : can(regex("^(/[A-Za-z0-9._~-]+)+$", path))])
+    error_message = "exception_paths entries must be absolute paths without a trailing slash, made of letters, digits and \"._~-\", e.g. \"/api/mcp\"."
   }
 }
 

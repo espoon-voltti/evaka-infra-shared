@@ -2,6 +2,11 @@ locals {
   acl_name          = "${var.name_prefix}-waf"
   whitelist_enabled = length(var.rate_limit_whitelist_ips) > 0
 
+  # Each path matches itself and everything beneath it, but not a longer
+  # sibling: "/api/mcp" matches "/api/mcp/x" and not "/api/mcpx". The variable's
+  # validation leaves "." as the only regex metacharacter a path can contain.
+  exception_paths_regex = "^(${join("|", [for path in var.exception_paths : replace(path, ".", "\\.")])})(/|$)"
+
   # The alarms need the region, and this module spans AWS provider 5.x and 6.x,
   # whose aws_region data source disagrees on the attribute that holds it
   # (`name` vs `region`). The ACL's own ARN carries it in either.
@@ -122,6 +127,48 @@ resource "aws_wafv2_web_acl" "this" {
       visibility_config {
         cloudwatch_metrics_enabled = true
         metric_name                = "${var.name_prefix}-basic-auth-exception"
+        sampled_requests_enabled   = var.enable_sampled_requests
+      }
+    }
+  }
+
+  # Requests to the exception paths skip every rule below.
+  dynamic "rule" {
+    for_each = length(var.exception_paths) > 0 ? [1] : []
+
+    content {
+      name     = "${var.name_prefix}-path-exception"
+      priority = 60
+
+      action {
+        allow {}
+      }
+
+      statement {
+        regex_match_statement {
+          regex_string = local.exception_paths_regex
+
+          field_to_match {
+            uri_path {}
+          }
+
+          # eVaka's nginx and apigw forward the path as sent, so without these
+          # "/api/mcp/../employee/x" would be allowed here and reach
+          # evaka-service with its dot segments intact.
+          text_transformation {
+            priority = 0
+            type     = "URL_DECODE"
+          }
+          text_transformation {
+            priority = 1
+            type     = "NORMALIZE_PATH"
+          }
+        }
+      }
+
+      visibility_config {
+        cloudwatch_metrics_enabled = true
+        metric_name                = "${var.name_prefix}-path-exception"
         sampled_requests_enabled   = var.enable_sampled_requests
       }
     }
