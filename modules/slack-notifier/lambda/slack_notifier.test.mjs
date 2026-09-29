@@ -694,7 +694,11 @@ describe('buildSessionDigestPayload', () => {
           'i-abc',
           3
         ),
-        row('arn:aws:sts::123:assumed-role/Reader/reader@example.com', 'i-def', 1)
+        row(
+          'arn:aws:sts::123:assumed-role/Reader/reader@example.com',
+          'i-def',
+          1
+        )
       ],
       ''
     )
