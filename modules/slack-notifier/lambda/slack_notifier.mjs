@@ -160,7 +160,8 @@ export {
   formatErrorCount,
   formatRemainder,
   FORMAT_PRESETS,
-  EVAKA_PRESET
+  EVAKA_PRESET,
+  NGINX_PRESET
 } from './checks/log-error.mjs'
 export { buildSessionDigestPayload } from './checks/session-audit.mjs'
 export { buildAlarmPayload } from './messages/alarm.mjs'

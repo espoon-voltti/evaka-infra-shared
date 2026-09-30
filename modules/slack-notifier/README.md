@@ -89,7 +89,7 @@ log_sources = {
   service = {
     log_group_name_prefixes   = ["/aws/ecs/${var.name_prefix}/service"]
     format                    = "logback-json"
-    throw_site_package_prefix = "fi.espoo.oppivelvollisuus"
+    throw_site_package_prefix = "com.example.app"
   }
   api-gateway = {
     log_group_name_prefixes = ["/aws/ecs/${var.name_prefix}/api-gateway"]
@@ -101,11 +101,15 @@ log_sources = {
 - `format` selects a built-in field mapping: `"logback-json"` for a
   Logback/`logstash-logback-encoder` service (the same convention eVaka
   itself uses, just not hardcoded to eVaka's own field values), `"pino-json"`
-  for a pino-based Node service. `"pino-json"` expects the Voltti api-gateway
+  for a pino-based Node service. `"pino-json"` expects an api-gateway
   logger setup (`messageKey: 'message'`, a string `level` label, `appName` in
   the logger's base fields); its error entries carry no request context, so
   their Slack lines and the `endpoint` column show the logger name rather than
-  a `METHOD /path`.
+  a `METHOD /path`. `"nginx"` reads plain-text nginx logs, which have no level
+  field at all: it matches the severity tag nginx writes into the line
+  (`[emerg]`, `[alert]`, `[crit]`, `[error]`) and reports the line as it
+  stands. Matching the tag rather than the word "error" keeps out access-log
+  lines for requests that merely contain it.
 - `log_group_name_prefixes` grants `logs:StartQuery` on a prefix-wildcarded ARN
   and has the lambda resolve actual log group names via `DescribeLogGroups` at
   invocation time, so a source can be wired up before the log groups it will
@@ -121,7 +125,7 @@ log_sources = {
   api-gateway and an nginx frontend under one shared prefix. A log group whose
   entries don't match the source's `format` fails the error-level filter
   silently, so over-broad prefixes lose errors rather than reporting bogus ones.
-- `throw_site_package_prefix` (e.g. `"fi.espoo.vakaseteli"`) replaces eVaka's
+- `throw_site_package_prefix` (e.g. `"com.example.app"`) replaces eVaka's
   hardcoded `at evaka.` stack-frame matching for both the throw-site deep-link
   line and the `AsyncJobPool` retry-in-progress noise mute, which is derived
   automatically from it. Omit it to skip both. The derived mute assumes the
@@ -129,18 +133,21 @@ log_sources = {
   a `meta.remainingAttempts` field — check the app's `AsyncJobPool` before
   relying on it, since a mute that matches nothing is invisible. Only
   `"logback-json"` derives it.
+- `channel` posts this source's messages to a Slack channel of its own instead
+  of the account's, for a source whose volume does not belong in the channel
+  the application's own alerts go to. Query failures still warn in the
+  account's channel.
 - `extra_noise_filters` is a list of raw Insights `filter` lines, appended to
   the query verbatim, for noise rules specific to one app that don't fit the
   shared pattern above.
 - Each source's Slack messages are labelled `[<source name>]`, e.g. `[service]`
   — except when the source resolves to exactly one log group matching the
   `/aws/ecs/<name>/<component>` convention, where the label becomes
-  `[<name>/<source name>]` (e.g. `[oppivelvollisuus-esc-staging/service]`).
+  `[<name>/<source name>]` (e.g. `[example-staging/service]`).
   This distinguishes projects/environments sharing one Lambda and Slack
-  channel (an account can host several — see "One channel per account" in
-  `modules/baseline`) using the log group's own name rather than
-  `name_prefix`, which is this Lambda's own account-level name and can differ
-  from the environment that actually owns the log group.
+  channel (one account can host several) using the log group's own name rather
+  than `name_prefix`, which is this Lambda's own account-level name and can
+  differ from the environment that actually owns the log group.
 
 ### Metric alarms and region
 

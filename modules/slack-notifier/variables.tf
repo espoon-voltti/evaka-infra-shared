@@ -63,6 +63,9 @@ variable "log_sources" {
     log groups it will match exist, and picks up new ones with no redeploy.
     log_group_names grants on exact ARNs, for log groups known at apply time.
     At least one of the two must be set.
+
+    channel overrides the account's Slack channel for this source alone, for a
+    source whose volume belongs somewhere other than the app's own channel.
   EOT
   type = map(object({
     log_group_names           = optional(list(string), [])
@@ -70,12 +73,13 @@ variable "log_sources" {
     format                    = string
     throw_site_package_prefix = optional(string, "")
     extra_noise_filters       = optional(list(string), [])
+    channel                   = optional(string)
   }))
   default = {}
 
   validation {
-    condition     = alltrue([for s in var.log_sources : contains(["logback-json", "pino-json", "ssm-session-audit"], s.format)])
-    error_message = "log_sources[*].format must be \"logback-json\", \"pino-json\" or \"ssm-session-audit\"."
+    condition     = alltrue([for s in var.log_sources : contains(["logback-json", "pino-json", "nginx", "ssm-session-audit"], s.format)])
+    error_message = "log_sources[*].format must be \"logback-json\", \"pino-json\", \"nginx\" or \"ssm-session-audit\"."
   }
 
   validation {

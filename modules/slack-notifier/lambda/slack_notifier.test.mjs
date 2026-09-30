@@ -20,6 +20,7 @@ const {
   formatRemainder,
   FORMAT_PRESETS,
   EVAKA_PRESET,
+  NGINX_PRESET,
   buildQueryParts,
   buildInsightsFields,
   discoverLogGroupNames,
@@ -112,17 +113,17 @@ describe('extractThrowSite', () => {
     const stack = [
       'java.lang.RuntimeException: boom',
       '\tat evaka.core.pis.PersonService.getPerson(PersonService.kt:42)',
-      '\tat fi.espoo.vakaseteli.VoucherService.grant(VoucherService.kt:10)'
+      '\tat com.example.app.VoucherService.grant(VoucherService.kt:10)'
     ].join('\n')
     assert.equal(
-      extractThrowSite(stack, 'fi.espoo.vakaseteli'),
+      extractThrowSite(stack, 'com.example.app'),
       'VoucherService.grant(VoucherService.kt:10)'
     )
   })
 
   it('treats dots in a custom prefix literally, not as a regex wildcard', () => {
-    const stack = '\tat fiXespooXvakaseteli.Foo.bar(Foo.kt:1)'
-    assert.equal(extractThrowSite(stack, 'fi.espoo.vakaseteli'), null)
+    const stack = '\tat comXexampleXapp.Foo.bar(Foo.kt:1)'
+    assert.equal(extractThrowSite(stack, 'com.example.app'), null)
   })
 })
 
@@ -132,30 +133,57 @@ describe('extractThrowSite', () => {
 describe('buildQueryParts', () => {
   const preset = FORMAT_PRESETS['logback-json']
 
+  // The api-gateways log pino's `level` and the older `logLevel` into one log
+  // group, so a filter on either field alone loses the other's errors.
   it('filters on the preset error level, with no AsyncJobPool mute by default', () => {
     const parts = buildQueryParts(preset, '', [])
-    assert.equal(parts[0], 'filter tolower(logLevel) = "error"')
+    assert.equal(
+      parts[0],
+      'filter tolower(coalesce(logLevel, level)) = "error"'
+    )
     assert.ok(!parts.some((p) => p.includes('AsyncJobPool')))
   })
 
   it('derives the AsyncJobPool mute from a throw-site package prefix', () => {
-    const parts = buildQueryParts(preset, 'fi.espoo.vakaseteli', [])
+    const parts = buildQueryParts(preset, 'com.example.app', [])
     const muteFilter = parts.find((p) => p.includes('AsyncJobPool'))
     assert.ok(muteFilter)
     assert.ok(
       muteFilter.includes(
-        'loggerName like /^fi\\.espoo\\.vakaseteli\\.shared\\.asyncjob\\.AsyncJobPool\\./'
+        'loggerName like /^com\\.example\\.app\\.shared\\.asyncjob\\.AsyncJobPool\\./'
       )
+    )
+  })
+
+  it('accepts the other level field for a pino source', () => {
+    const parts = buildQueryParts(FORMAT_PRESETS['pino-json'], '', [])
+    assert.equal(
+      parts[0],
+      'filter tolower(coalesce(level, logLevel)) = "error"'
+    )
+  })
+
+  // nginx has no level field, so a level filter would match nothing at all
+  // and the source would look healthy while dropping every error.
+  it('filters plain-text nginx logs on the severity tag', () => {
+    const parts = buildQueryParts(NGINX_PRESET, '', [])
+    assert.equal(
+      parts[0],
+      'filter @message like /\\[(emerg|alert|crit|error)\\]/'
+    )
+    assert.equal(
+      buildInsightsFields(NGINX_PRESET),
+      'fields @timestamp, @message'
     )
   })
 
   it('appends extra noise filters verbatim', () => {
     const parts = buildQueryParts(preset, '', [
-      'filter loggerName not like /^fi\\.espoo\\.vakaseteli\\.SESEmailClient/'
+      'filter loggerName not like /^com\\.example\\.app\\.SESEmailClient/'
     ])
     assert.ok(
       parts.includes(
-        'filter loggerName not like /^fi\\.espoo\\.vakaseteli\\.SESEmailClient/'
+        'filter loggerName not like /^com\\.example\\.app\\.SESEmailClient/'
       )
     )
   })
@@ -168,7 +196,7 @@ describe('buildQueryParts', () => {
   it('derives no AsyncJobPool mute for a format that has no such logger', () => {
     const parts = buildQueryParts(
       FORMAT_PRESETS['pino-json'],
-      'fi.espoo.vakaseteli',
+      'com.example.app',
       []
     )
     assert.ok(!parts.some((p) => p.includes('AsyncJobPool')))
@@ -213,10 +241,10 @@ describe('discoverLogGroupNames', () => {
 
   it('collects log group names for a single prefix', async () => {
     cloudwatchLogsStub.describeLogGroupsResponses = [
-      { logGroups: [{ logGroupName: '/ecs/vakaseteli-service' }] }
+      { logGroups: [{ logGroupName: '/ecs/example-service' }] }
     ]
-    const names = await discoverLogGroupNames(['/ecs/vakaseteli-'])
-    assert.deepEqual([...names], ['/ecs/vakaseteli-service'])
+    const names = await discoverLogGroupNames(['/ecs/example-'])
+    assert.deepEqual([...names], ['/ecs/example-service'])
   })
 
   it('follows pagination via nextToken', async () => {
@@ -298,16 +326,14 @@ describe('resolveSourceLogGroupNames', () => {
 describe('deriveSourceLabel', () => {
   it('prefixes the source name with the app/environment parsed off the log group', () => {
     assert.equal(
-      deriveSourceLabel('service', [
-        '/aws/ecs/oppivelvollisuus-esc-staging/service'
-      ]),
-      'oppivelvollisuus-esc-staging/service'
+      deriveSourceLabel('service', ['/aws/ecs/example-staging/service']),
+      'example-staging/service'
     )
   })
 
   it('falls back to the source name alone for a non-ECS log group name', () => {
     assert.equal(
-      deriveSourceLabel('service', ['/ecs/oppivelvollisuus-service']),
+      deriveSourceLabel('service', ['/ecs/example-service']),
       'service'
     )
   })
@@ -315,8 +341,8 @@ describe('deriveSourceLabel', () => {
   it('falls back to the source name alone when several log groups resolve', () => {
     assert.equal(
       deriveSourceLabel('service', [
-        '/aws/ecs/oppivelvollisuus-esc-dev/service',
-        '/aws/ecs/oppivelvollisuus-esc-staging/service'
+        '/aws/ecs/example-dev/service',
+        '/aws/ecs/example-staging/service'
       ]),
       'service'
     )
@@ -453,7 +479,7 @@ describe('buildAlarmPayload', () => {
       {
         AlarmName: 'test-alarm',
         NewStateValue: 'ALARM',
-        AlarmDescription: 'Backup failed in evaka-staging',
+        AlarmDescription: 'Backup failed in example-staging',
         NewStateReason: 'Threshold exceeded',
         StateChangeTime: '2024-01-15T14:30:00Z'
       },
@@ -461,7 +487,7 @@ describe('buildAlarmPayload', () => {
     )
     // The description becomes the headline (not the technical "name is now STATE").
     const headline = payload.attachments[0].blocks[0].text.text
-    assert.ok(headline.includes('Backup failed in evaka-staging'))
+    assert.ok(headline.includes('Backup failed in example-staging'))
     assert.ok(!headline.includes('is now'))
     // It is not repeated as a field; only reason and time remain.
     const fieldsBlock = payload.attachments[0].blocks.find(
@@ -479,13 +505,13 @@ describe('buildAlarmPayload', () => {
       {
         AlarmName: 'test-alarm',
         NewStateValue: 'OK',
-        AlarmDescription: 'Backup failed in evaka-staging'
+        AlarmDescription: 'Backup failed in example-staging'
       },
       'eu-west-1'
     )
     const headline = payload.attachments[0].blocks[0].text.text
     assert.ok(headline.includes(':large_green_circle:'))
-    assert.ok(headline.includes('Recovered: Backup failed in evaka-staging'))
+    assert.ok(headline.includes('Recovered: Backup failed in example-staging'))
   })
 
   it('falls back to "name is now STATE" headline when description is absent', () => {
@@ -713,11 +739,11 @@ describe('buildSessionDigestPayload', () => {
   it('uses the singular form for one session and prefixes a label', () => {
     const payload = buildSessionDigestPayload(
       [row('root', 'i-abc', 1)],
-      'evaka-prod'
+      'example-prod'
     )
     assert.match(
       payload.attachments[0].blocks[0].text.text,
-      /:bell: \*\[evaka-prod\] 1 SSM session started\*/
+      /:bell: \*\[example-prod\] 1 SSM session started\*/
     )
     assert.equal(
       payload.attachments[0].blocks[1].text.text,
@@ -797,7 +823,7 @@ describe('handleSnsRecord', () => {
     await handleSnsRecord({
       Sns: {
         Message: JSON.stringify({
-          AlarmName: 'evaka-prod-rds-free-storage-space-critical',
+          AlarmName: 'example-prod-rds-free-storage-space-critical',
           AlarmDescription: 'RDS instance is running out of disk space',
           NewStateValue: 'ALARM'
         })
@@ -878,7 +904,8 @@ describe('handleLogCheck', () => {
   })
 
   it('queries the configured log groups with the eVaka query verbatim', async () => {
-    process.env.LOG_GROUP_NAMES = '/aws/ecs/evaka-service,/aws/ecs/evaka-apigw'
+    process.env.LOG_GROUP_NAMES =
+      '/aws/ecs/example-service,/aws/ecs/example-apigw'
     const { handleLogCheck } = await freshModule()
 
     await handleLogCheck('aws')
@@ -888,8 +915,8 @@ describe('handleLogCheck', () => {
     )
     assert.equal(startQueryCall.input.queryString, EVAKA_QUERY)
     assert.deepEqual(startQueryCall.input.logGroupNames, [
-      '/aws/ecs/evaka-service',
-      '/aws/ecs/evaka-apigw'
+      '/aws/ecs/example-service',
+      '/aws/ecs/example-apigw'
     ])
   })
 
@@ -988,12 +1015,12 @@ describe('handleLogSourceCheck', () => {
   it('parses a logback-json source with its own field names and package prefix', async () => {
     const { handleLogSourceCheck } = await freshModule()
     const logLine = JSON.stringify({
-      loggerName: 'fi.espoo.oppivelvollisuus.SomeService',
+      loggerName: 'com.example.app.SomeService',
       logLevel: 'ERROR',
       message: 'Something broke',
       exception: 'java.lang.RuntimeException',
       stackTrace:
-        'java.lang.RuntimeException: boom\n\tat fi.espoo.oppivelvollisuus.SomeService.doThing(SomeService.kt:10)',
+        'java.lang.RuntimeException: boom\n\tat com.example.app.SomeService.doThing(SomeService.kt:10)',
       httpMethod: 'GET',
       path: '/api/foo',
       traceId: 'abc123'
@@ -1014,10 +1041,10 @@ describe('handleLogSourceCheck', () => {
     await handleLogSourceCheck(
       'service',
       {
-        log_group_names: ['/ecs/oppivelvollisuus-service'],
+        log_group_names: ['/ecs/example-service'],
         log_group_name_prefixes: [],
         format: 'logback-json',
-        throw_site_package_prefix: 'fi.espoo.oppivelvollisuus',
+        throw_site_package_prefix: 'com.example.app',
         extra_noise_filters: []
       },
       'aws'
@@ -1037,7 +1064,7 @@ describe('handleLogSourceCheck', () => {
     )
     assert.ok(
       startQueryCall.input.queryString.includes(
-        'loggerName like /^fi\\.espoo\\.oppivelvollisuus\\.shared\\.asyncjob\\.AsyncJobPool\\./'
+        'loggerName like /^com\\.example\\.app\\.shared\\.asyncjob\\.AsyncJobPool\\./'
       )
     )
   })
@@ -1060,10 +1087,10 @@ describe('handleLogSourceCheck', () => {
     await handleLogSourceCheck(
       'service',
       {
-        log_group_names: ['/aws/ecs/oppivelvollisuus-esc-staging/service'],
+        log_group_names: ['/aws/ecs/example-staging/service'],
         log_group_name_prefixes: [],
         format: 'logback-json',
-        throw_site_package_prefix: 'fi.espoo.oppivelvollisuus',
+        throw_site_package_prefix: 'com.example.app',
         extra_noise_filters: []
       },
       'aws'
@@ -1071,7 +1098,7 @@ describe('handleLogSourceCheck', () => {
 
     assert.equal(posted.length, 1)
     const header = posted[0].attachments[0].blocks[0].text.text
-    assert.ok(header.includes('[oppivelvollisuus-esc-staging/service]'))
+    assert.ok(header.includes('[example-staging/service]'))
   })
 
   it('parses a pino-json source using level/name instead of logLevel/loggerName', async () => {
@@ -1080,7 +1107,7 @@ describe('handleLogSourceCheck', () => {
     // an appName from the logger's base fields, and no request context.
     const logLine = JSON.stringify({
       name: 'app',
-      appName: 'oppivelvollisuus-api-gateway',
+      appName: 'example-api-gateway',
       level: 'error',
       message: 'Boom',
       exception: 'Error',
@@ -1123,14 +1150,18 @@ describe('handleLogSourceCheck', () => {
     const startQueryCall = cloudwatchLogsStub.calls.find(
       (c) => c.constructor.name === 'StartQueryCommand'
     )
-    assert.ok(startQueryCall.input.queryString.includes('tolower(level)'))
+    assert.ok(
+      startQueryCall.input.queryString.includes(
+        'tolower(coalesce(level, logLevel))'
+      )
+    )
     assert.ok(!startQueryCall.input.queryString.includes('AsyncJobPool'))
   })
 
   it('discovers log groups from a prefix before querying', async () => {
     const { handleLogSourceCheck } = await freshModule()
     cloudwatchLogsStub.describeLogGroupsResponses = [
-      { logGroups: [{ logGroupName: '/ecs/vakaseteli-service' }] }
+      { logGroups: [{ logGroupName: '/ecs/example-service' }] }
     ]
     cloudwatchLogsStub.getQueryResultsResponses = [
       { status: 'Complete', results: [], statistics: { recordsMatched: 0 } }
@@ -1140,7 +1171,7 @@ describe('handleLogSourceCheck', () => {
       'service',
       {
         log_group_names: [],
-        log_group_name_prefixes: ['/ecs/vakaseteli-'],
+        log_group_name_prefixes: ['/ecs/example-'],
         format: 'logback-json',
         throw_site_package_prefix: '',
         extra_noise_filters: []
@@ -1152,7 +1183,7 @@ describe('handleLogSourceCheck', () => {
       (c) => c.constructor.name === 'StartQueryCommand'
     )
     assert.deepEqual(startQueryCall.input.logGroupNames, [
-      '/ecs/vakaseteli-service'
+      '/ecs/example-service'
     ])
   })
 
@@ -1173,6 +1204,53 @@ describe('handleLogSourceCheck', () => {
 
     assert.equal(cloudwatchLogsStub.calls.length, 0)
     assert.equal(posted.length, 0)
+  })
+
+  // A real nginx line: plain text, no JSON, so the JSON branch must not eat it
+  // and the message has to survive into Slack as written.
+  it('reports plain-text nginx lines and honours a per-source channel', async () => {
+    const { handleLogSourceCheck } = await freshModule()
+    const nginxLine =
+      '2026/09/30 01:31:15 [error] 29#29: *298345 directory index of "/static/assets/" is forbidden, client: 10.0.0.1'
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      {
+        status: 'Complete',
+        results: [
+          [
+            { field: '@timestamp', value: '2026-09-30 01:31:15.000' },
+            { field: '@message', value: nginxLine }
+          ]
+        ],
+        statistics: { recordsMatched: 1 }
+      }
+    ]
+
+    await handleLogSourceCheck(
+      'frontend',
+      {
+        log_group_names: ['/aws/ecs/example-prod/frontend'],
+        log_group_name_prefixes: [],
+        format: 'nginx',
+        throw_site_package_prefix: '',
+        extra_noise_filters: [],
+        channel: '#example-alerts'
+      },
+      'aws'
+    )
+
+    const query = cloudwatchLogsStub.calls.find(
+      (c) => c.constructor.name === 'StartQueryCommand'
+    ).input.queryString
+    assert.match(
+      query,
+      /filter @message like \/\\\[\(emerg\|alert\|crit\|error\)\\\]\//
+    )
+
+    assert.equal(posted.length, 1)
+    assert.equal(posted[0].channel, '#example-alerts')
+    const blocks = posted[0].attachments[0].blocks
+    assert.match(blocks[0].text.text, /\[example-prod\/frontend\] 1 error\(s\)/)
+    assert.ok(blocks[1].text.text.includes('directory index of'))
   })
 
   it('warns on Slack when the query never completes', async () => {
@@ -1239,11 +1317,11 @@ describe('handler on a scheduled event', () => {
   // A source whose log groups cannot even be listed used to be indistinguishable
   // in Slack from one that found no errors.
   it('warns about a log source that cannot be run, without skipping the others', async () => {
-    process.env.LOG_GROUP_NAMES = '/aws/ecs/evaka-service'
+    process.env.LOG_GROUP_NAMES = '/aws/ecs/example-service'
     process.env.LOG_SOURCES_JSON = JSON.stringify({
       service: {
         log_group_names: [],
-        log_group_name_prefixes: ['/ecs/oppivelvollisuus-'],
+        log_group_name_prefixes: ['/ecs/example-'],
         format: 'logback-json',
         throw_site_package_prefix: '',
         extra_noise_filters: []
@@ -1280,7 +1358,7 @@ describe('handler on a scheduled event', () => {
   it('warns about a failed query under the environment-qualified label', async () => {
     process.env.LOG_SOURCES_JSON = JSON.stringify({
       service: {
-        log_group_names: ['/aws/ecs/oppivelvollisuus-esc-staging/service'],
+        log_group_names: ['/aws/ecs/example-staging/service'],
         log_group_name_prefixes: [],
         format: 'logback-json',
         throw_site_package_prefix: '',
@@ -1298,7 +1376,7 @@ describe('handler on a scheduled event', () => {
     assert.equal(posted.length, 1)
     assert.ok(
       posted[0].attachments[0].blocks[0].text.text.includes(
-        'log source "oppivelvollisuus-esc-staging/service" could not be run:'
+        'log source "example-staging/service" could not be run:'
       )
     )
   })
@@ -1308,7 +1386,7 @@ describe('handler on a scheduled event', () => {
   it('warns about a failed SSM session audit with how long it polled', async () => {
     process.env.LOG_SOURCES_JSON = JSON.stringify({
       'ssm-sessions': {
-        log_group_names: ['/aws/events/voltti-session-manager-ssm-sessions'],
+        log_group_names: ['/aws/events/example-ssm-sessions'],
         log_group_name_prefixes: [],
         format: 'ssm-session-audit',
         throw_site_package_prefix: '',
@@ -1341,7 +1419,7 @@ describe('handler on a scheduled event', () => {
   it('stays silent when the log group is too new for the query window', async () => {
     process.env.LOG_SOURCES_JSON = JSON.stringify({
       'ssm-sessions': {
-        log_group_names: ['/aws/events/voltti-session-manager-ssm-sessions'],
+        log_group_names: ['/aws/events/example-ssm-sessions'],
         log_group_name_prefixes: [],
         format: 'ssm-session-audit',
         throw_site_package_prefix: '',

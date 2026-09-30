@@ -52,9 +52,12 @@ export async function getSlackWebhookUrl() {
   return result.Parameter.Value
 }
 
-export async function postToSlack(payload) {
+// channelOverride routes one source's messages somewhere other than the
+// account's channel, e.g. a noisy source to an infra channel while the app's
+// own alerts stay where its team reads them.
+export async function postToSlack(payload, channelOverride) {
   const webhookUrl = await getSlackWebhookUrl()
-  const channel = process.env.SLACK_CHANNEL
+  const channel = channelOverride ?? process.env.SLACK_CHANNEL
   const username = process.env.SLACK_USERNAME
   const body = {
     ...payload,

@@ -15,9 +15,15 @@ import {
 
 // Field-name mapping per logging convention a log_sources entry selects via
 // `format`.
+// An api-gateway can write both conventions into one log group: pino lines for
+// requests and older logger lines (logLevel) for startup and config. Filtering
+// on one field alone drops the errors written in the other and the source looks
+// healthy, so each JSON preset names the field it expects plus the one it may
+// also meet.
 export const FORMAT_PRESETS = {
   'logback-json': {
     level: 'logLevel',
+    fallbackLevel: 'level',
     logger: 'loggerName',
     message: 'message',
     exception: 'exception',
@@ -30,6 +36,7 @@ export const FORMAT_PRESETS = {
   },
   'pino-json': {
     level: 'level',
+    fallbackLevel: 'logLevel',
     logger: 'name',
     message: 'message',
     exception: 'exception',
@@ -58,7 +65,15 @@ export const EVAKA_PRESET = {
   traceId: 'traceId'
 }
 
-const PRESETS = { ...FORMAT_PRESETS, evaka: EVAKA_PRESET }
+// nginx logs plain text, so no field holds the level: the severity is the
+// "[error]" tag nginx writes into the line. Matching that tag rather than the
+// word "error" keeps out access-log lines for requests that merely mention it.
+export const NGINX_PRESET = {
+  text: true,
+  severities: ['emerg', 'alert', 'crit', 'error']
+}
+
+const PRESETS = { ...FORMAT_PRESETS, evaka: EVAKA_PRESET, nginx: NGINX_PRESET }
 
 const EVAKA_NOISE_FILTERS = [
   'filter not (loggerName like /^evaka\\.core\\.shared\\.async\\.AsyncJobPool\\./ and meta.remainingAttempts > 0)',
@@ -74,7 +89,12 @@ export function buildQueryParts(
   throwSitePackagePrefix,
   extraNoiseFilters
 ) {
-  const parts = [`filter tolower(${preset.level}) = "error"`]
+  const level = preset.fallbackLevel
+    ? `coalesce(${preset.level}, ${preset.fallbackLevel})`
+    : preset.level
+  const parts = preset.text
+    ? [`filter @message like /\\[(${preset.severities.join('|')})\\]/`]
+    : [`filter tolower(${level}) = "error"`]
   if (throwSitePackagePrefix && preset.asyncJobPoolLogger) {
     const loggerPrefix = escapeRegExp(
       `${throwSitePackagePrefix}.${preset.asyncJobPoolLogger}.`
@@ -88,6 +108,7 @@ export function buildQueryParts(
 }
 
 export function buildInsightsFields(preset) {
+  if (preset.text) return 'fields @timestamp, @message'
   const endpointPath = preset.endpointPath ?? preset.httpPath
   const endpoint =
     preset.httpMethod && endpointPath
@@ -310,7 +331,10 @@ async function run(sourceName, source, logGroupNames, partition) {
   })
 
   try {
-    await postToSlack({ attachments: [{ color: '#d32f2f', blocks }] })
+    await postToSlack(
+      { attachments: [{ color: '#d32f2f', blocks }] },
+      source.channel
+    )
   } catch (err) {
     console.error(
       `Failed to post detailed message${scanName}, trying fallback:`,
@@ -332,14 +356,15 @@ async function run(sourceName, source, logGroupNames, partition) {
         }
       }
     ]
-    await postToSlack({
-      attachments: [{ color: '#d32f2f', blocks: fallbackBlocks }]
-    })
+    await postToSlack(
+      { attachments: [{ color: '#d32f2f', blocks: fallbackBlocks }] },
+      source.channel
+    )
   }
 }
 
 export default {
   name: 'log-error',
-  formats: ['logback-json', 'pino-json', 'evaka'],
+  formats: ['logback-json', 'pino-json', 'evaka', 'nginx'],
   run
 }

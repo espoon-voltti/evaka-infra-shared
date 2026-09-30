@@ -79,7 +79,7 @@ async function run(sourceName, source, logGroupNames, partition) {
   }
   if (results.length === 0) return
 
-  await postToSlack(buildSessionDigestPayload(results, label))
+  await postToSlack(buildSessionDigestPayload(results, label), source.channel)
 }
 
 export default {
