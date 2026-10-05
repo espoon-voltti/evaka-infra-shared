@@ -7,10 +7,12 @@ import {
   postToSlack,
   warnSlack,
   formatTimestamp,
-  consoleDomain,
   deriveSourceLabel,
   defaultQueryWindow,
-  runInsightsQuery
+  runInsightsQuery,
+  buildLogInsightsUrl,
+  resolveMatchedCount,
+  formatRemainder
 } from '../lib.mjs'
 
 // Field-name mapping per logging convention a log_sources entry selects via
@@ -139,47 +141,8 @@ export function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-export function buildLogInsightsUrl(
-  query,
-  logGroups,
-  startTime,
-  endTime,
-  region = REGION,
-  partition = 'aws'
-) {
-  // CloudWatch console URL fragment encoding is undocumented by AWS.
-  // See https://github.com/aws/aws-sdk-js-v3/issues/6016
-  const encode = (str) =>
-    str.replace(
-      /[~'()*\s"\\|/=<>]/g,
-      (ch) => '*' + ch.charCodeAt(0).toString(16).padStart(2, '0')
-    )
-  const sourceList = logGroups.map((g) => `~'${encode(g)}`).join('')
-  return (
-    `https://${region}.console.${consoleDomain(partition)}/cloudwatch/home` +
-    `?region=${region}#logsV2:logs-insights` +
-    `$3FqueryDetail$3D~(` +
-    `end~${endTime * 1000}` +
-    `~start~${startTime * 1000}` +
-    `~timeType~'ABSOLUTE` +
-    `~unit~'seconds` +
-    `~editorString~'${encode(query)}` +
-    `~source~(${sourceList}))`
-  )
-}
-
-export function resolveMatchedCount(statistics, resultsLength) {
-  const matched = statistics?.recordsMatched
-  return typeof matched === 'number' ? Math.round(matched) : resultsLength
-}
-
 export function formatErrorCount(matchedCount, periodMinutes) {
   return `${matchedCount} error(s) in the last ${periodMinutes} minutes`
-}
-
-export function formatRemainder(matchedCount, shownCount) {
-  const remainder = matchedCount - shownCount
-  return remainder > 0 ? `_...and ${remainder} more not shown_` : null
 }
 
 async function run(sourceName, source, logGroupNames, partition) {
