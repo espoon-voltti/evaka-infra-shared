@@ -15,6 +15,8 @@ const {
   buildAlarmPayload,
   buildNotificationPayload,
   buildSessionDigestPayload,
+  buildAuditQuery,
+  buildAuditEventPayload,
   resolveMatchedCount,
   formatErrorCount,
   formatRemainder,
@@ -752,6 +754,137 @@ describe('buildSessionDigestPayload', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// buildAuditQuery
+// ---------------------------------------------------------------------------
+describe('buildAuditQuery', () => {
+  it('matches one event code, newest first', () => {
+    const query = buildAuditQuery(['EmployeeUpdateGlobalRoles'], [])
+    assert.deepEqual(query.split('\n| '), [
+      'fields @timestamp, @message',
+      'filter eventCode in ["EmployeeUpdateGlobalRoles"]',
+      'sort @timestamp desc',
+      'limit 20'
+    ])
+  })
+
+  it('matches any of several event codes', () => {
+    const query = buildAuditQuery(['EmployeeCreate', 'EmployeeDelete'], [])
+    assert.ok(
+      query.includes('filter eventCode in ["EmployeeCreate", "EmployeeDelete"]')
+    )
+  })
+
+  it('applies the match filters after the event code filter', () => {
+    const query = buildAuditQuery(
+      ['EmployeeUpdateGlobalRoles'],
+      ['filter @message like /"globalRoles":\\[[^\\]]*"ADMIN"/']
+    )
+    assert.deepEqual(query.split('\n| ').slice(1, 3), [
+      'filter eventCode in ["EmployeeUpdateGlobalRoles"]',
+      'filter @message like /"globalRoles":\\[[^\\]]*"ADMIN"/'
+    ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildAuditEventPayload
+// ---------------------------------------------------------------------------
+describe('buildAuditEventPayload', () => {
+  // 14:30 UTC in January is 16.30.00 Helsinki time.
+  const row = (entry) => [
+    { field: '@timestamp', value: '2024-01-15T14:30:00Z' },
+    {
+      field: '@message',
+      value: typeof entry === 'string' ? entry : JSON.stringify(entry)
+    }
+  ]
+
+  it('reports the event, the actor, the target and the meta', () => {
+    const payload = buildAuditEventPayload(
+      [
+        row({
+          eventCode: 'EmployeeUpdateGlobalRoles',
+          userId: 'user-1',
+          targetId: 'employee-2',
+          meta: { globalRoles: ['ADMIN'] }
+        })
+      ],
+      'example-prod/admin-granted',
+      1,
+      'https://example.test/insights'
+    )
+
+    assert.equal(payload.attachments[0].color, '#ff9800')
+    const blocks = payload.attachments[0].blocks
+    assert.match(
+      blocks[0].text.text,
+      /:rotating_light: \*\[example-prod\/admin-granted\] 1 audit event\* in the last ~5 min/
+    )
+    assert.equal(
+      blocks[1].text.text,
+      '`16.30.00` *EmployeeUpdateGlobalRoles* by `user-1` on `employee-2`\n`{"globalRoles":["ADMIN"]}`'
+    )
+    assert.ok(blocks[2].text.text.includes('https://example.test/insights'))
+  })
+
+  it('uses the plural form and reports the events the limit left out', () => {
+    const payload = buildAuditEventPayload(
+      [
+        row({ eventCode: 'EmployeeCreate' }),
+        row({ eventCode: 'EmployeeCreate' })
+      ],
+      '',
+      25,
+      ''
+    )
+    const blocks = payload.attachments[0].blocks
+    assert.match(blocks[0].text.text, /:rotating_light: \*25 audit events\*/)
+    assert.equal(
+      blocks[blocks.length - 1].text.text,
+      '_...and 23 more not shown_'
+    )
+  })
+
+  it('omits the identity and meta parts an entry does not carry', () => {
+    const payload = buildAuditEventPayload(
+      [row({ eventCode: 'EmployeeDelete', meta: {} })],
+      '',
+      1,
+      ''
+    )
+    assert.equal(
+      payload.attachments[0].blocks[1].text.text,
+      '`16.30.00` *EmployeeDelete*'
+    )
+  })
+
+  it('renders an entry that is not JSON as it stands', () => {
+    const payload = buildAuditEventPayload(
+      [row('a plain audit line')],
+      '',
+      1,
+      ''
+    )
+    assert.equal(
+      payload.attachments[0].blocks[1].text.text,
+      '`16.30.00` a plain audit line'
+    )
+  })
+
+  it('truncates meta too long to read in Slack', () => {
+    const payload = buildAuditEventPayload(
+      [row({ eventCode: 'EmployeeCreate', meta: { note: 'x'.repeat(400) } })],
+      '',
+      1,
+      ''
+    )
+    const text = payload.attachments[0].blocks[1].text.text
+    assert.ok(text.endsWith('...`'))
+    assert.ok(text.length < 400)
+  })
+})
+
 describe('buildNotificationPayload', () => {
   it('renders a subject as the headline and the text below it', () => {
     const payload = buildNotificationPayload(
@@ -1438,5 +1571,85 @@ describe('handler on a scheduled event', () => {
     await handler({ source: 'aws.events' }, context)
 
     assert.equal(posted.length, 0)
+  })
+
+  it('reports the audit entries a source names, with a console link', async () => {
+    process.env.LOG_SOURCES_JSON = JSON.stringify({
+      'admin-granted': {
+        log_group_names: ['evaka-service-prod'],
+        log_group_name_prefixes: [],
+        format: 'evaka-audit',
+        audit_event_codes: ['EmployeeUpdateGlobalRoles'],
+        audit_match_filters: [
+          'filter @message like /"globalRoles":\\[[^\\]]*"ADMIN"/'
+        ]
+      }
+    })
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      {
+        status: 'Complete',
+        results: [
+          [
+            { field: '@timestamp', value: '2024-01-15T14:30:00Z' },
+            {
+              field: '@message',
+              value: JSON.stringify({
+                eventCode: 'EmployeeUpdateGlobalRoles',
+                userId: 'user-1',
+                meta: { globalRoles: ['ADMIN'] }
+              })
+            }
+          ]
+        ],
+        statistics: { recordsMatched: 1 }
+      }
+    ]
+    const { handler } = await freshModule()
+
+    await handler({ source: 'aws.events' }, context)
+
+    const query = cloudwatchLogsStub.calls.find(
+      (c) => c.constructor.name === 'StartQueryCommand'
+    ).input.queryString
+    assert.ok(
+      query.includes('filter eventCode in ["EmployeeUpdateGlobalRoles"]')
+    )
+    assert.ok(query.includes('"globalRoles"'))
+
+    assert.equal(posted.length, 1)
+    const blocks = posted[0].attachments[0].blocks
+    assert.match(blocks[0].text.text, /\[admin-granted\] 1 audit event\*/)
+    assert.ok(blocks[1].text.text.includes('EmployeeUpdateGlobalRoles'))
+    assert.ok(blocks[2].text.text.includes('logs-insights'))
+  })
+
+  it('warns about a failed audit event scan with how long it polled', async () => {
+    process.env.LOG_SOURCES_JSON = JSON.stringify({
+      'admin-granted': {
+        log_group_names: ['evaka-service-prod'],
+        log_group_name_prefixes: [],
+        format: 'evaka-audit',
+        audit_event_codes: ['EmployeeUpdateGlobalRoles'],
+        audit_match_filters: []
+      }
+    })
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      { status: 'Failed', results: null, statistics: null }
+    ]
+    const originalWarn = console.warn
+    console.warn = () => {}
+    const { handler } = await freshModule()
+
+    try {
+      await handler({ source: 'aws.events' }, context)
+    } finally {
+      console.warn = originalWarn
+    }
+
+    assert.equal(posted.length, 1)
+    assert.match(
+      posted[0].attachments[0].blocks[0].text.text,
+      /Audit event scan for "admin-granted" failed after 1 attempts in \d+ms \(last status: Failed\)/
+    )
   })
 })

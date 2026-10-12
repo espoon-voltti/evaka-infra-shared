@@ -16,13 +16,14 @@ import {
 
 import logError from './checks/log-error.mjs'
 import sessionAudit from './checks/session-audit.mjs'
+import auditEvent from './checks/audit-event.mjs'
 import alarm from './messages/alarm.mjs'
 import notification from './messages/notification.mjs'
 
 // Order matters: notification.matches() is the catch-all, so it stays last.
 const MESSAGES = [alarm, notification]
 
-const CHECKS = [logError, sessionAudit]
+const CHECKS = [logError, sessionAudit, auditEvent]
 const checkByFormat = Object.fromEntries(
   CHECKS.flatMap((check) => check.formats.map((format) => [format, check]))
 )
@@ -149,20 +150,24 @@ export {
   formatTimestamp,
   discoverLogGroupNames,
   resolveSourceLogGroupNames,
-  deriveSourceLabel
+  deriveSourceLabel,
+  buildLogInsightsUrl,
+  resolveMatchedCount,
+  formatRemainder
 } from './lib.mjs'
 export {
   buildQueryParts,
   buildInsightsFields,
   extractThrowSite,
-  buildLogInsightsUrl,
-  resolveMatchedCount,
   formatErrorCount,
-  formatRemainder,
   FORMAT_PRESETS,
   EVAKA_PRESET,
   NGINX_PRESET
 } from './checks/log-error.mjs'
 export { buildSessionDigestPayload } from './checks/session-audit.mjs'
+export {
+  buildAuditQuery,
+  buildAuditEventPayload
+} from './checks/audit-event.mjs'
 export { buildAlarmPayload } from './messages/alarm.mjs'
 export { buildNotificationPayload } from './messages/notification.mjs'

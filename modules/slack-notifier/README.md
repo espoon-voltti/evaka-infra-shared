@@ -15,10 +15,11 @@ Forwards CloudWatch alarm state changes and application log errors to Slack.
   `<alarm-name> is now <STATE>`. Console deep-links resolve in both the standard
   `aws` partition and AWS European Sovereign Cloud (`aws-eusc`).
 - An EventBridge schedule (`cron(2/5 * * * ? *)`) that triggers the lambda to
-  scan recent log entries and post any errors found — **only when
-  `log_group_names` or `log_sources` is non-empty**. Each configured source
-  (the fixed `log_group_names` scan, plus one per `log_sources` entry) runs
-  its own Insights query and posts its own Slack message. The scans run
+  scan recent log entries and post what it finds, errors or the audit events a
+  source watches — **only when `log_group_names` or `log_sources` is
+  non-empty**. Each configured source (the fixed `log_group_names` scan, plus
+  one per `log_sources` entry) runs its own Insights query and posts its own
+  Slack message. The scans run
   concurrently, and a scan that fails outright — a denied query, more log
   groups than one query accepts — posts a warning rather than staying quiet,
   so a broken source is not mistaken for a clean one.
@@ -109,7 +110,9 @@ log_sources = {
   field at all: it matches the severity tag nginx writes into the line
   (`[emerg]`, `[alert]`, `[crit]`, `[error]`) and reports the line as it
   stands. Matching the tag rather than the word "error" keeps out access-log
-  lines for requests that merely contain it.
+  lines for requests that merely contain it. `"evaka-audit"` does not look for
+  errors at all: it reports the audit entries a source names, see
+  [Audit event watching](#audit-event-watching-evaka-audit).
 - `log_group_name_prefixes` grants `logs:StartQuery` on a prefix-wildcarded ARN
   and has the lambda resolve actual log group names via `DescribeLogGroups` at
   invocation time, so a source can be wired up before the log groups it will
@@ -148,6 +151,43 @@ log_sources = {
   channel (one account can host several) using the log group's own name rather
   than `name_prefix`, which is this Lambda's own account-level name and can
   differ from the environment that actually owns the log group.
+
+### Audit event watching (`evaka-audit`)
+
+A source with `format = "evaka-audit"` reports eVaka audit entries rather than
+errors. One source is one rule:
+
+```hcl
+log_sources = {
+  admin-granted = {
+    log_group_names     = ["evaka-service-prod"]
+    format              = "evaka-audit"
+    audit_event_codes   = ["EmployeeUpdateGlobalRoles"]
+    audit_match_filters = ["filter @message like /\"globalRoles\":\\[[^\\]]*\"ADMIN\"/"]
+    channel             = "#security"
+  }
+}
+```
+
+- `audit_event_codes` lists the `eventCode` values to report. At least one is
+  required: a source with none would report every audit entry the service
+  writes.
+- `audit_match_filters` are raw Insights `filter` lines, applied after the
+  event-code filter, that narrow which of the matched entries matter. The
+  example reports only the role updates that granted `ADMIN`.
+- Each Slack line carries the entry's `eventCode`, its `userId` and `targetId`
+  when present, and `meta` as JSON, followed by a link to the query in the
+  console. An entry that is not JSON is shown as it stands.
+- Insights flattens a JSON array into `meta.globalRoles.0`,
+  `meta.globalRoles.1` and so on, so a filter cannot match an array's members
+  by value. Match the raw line with `@message like`, as the example does.
+- eVaka writes its audit entries into the service's own log group, which is
+  normally also in `log_group_names`. Both scans read it independently: an audit
+  entry carries no level field, so the error scan never reports one.
+- The scan runs on the shared 5-minute schedule and query window, so a message
+  arrives about 5 minutes after the event (the window ends one CloudWatch
+  indexing delay in the past), and an entry near a window boundary can be
+  reported twice.
 
 ### Metric alarms and region
 

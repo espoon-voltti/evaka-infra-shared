@@ -64,6 +64,11 @@ variable "log_sources" {
     log_group_names grants on exact ARNs, for log groups known at apply time.
     At least one of the two must be set.
 
+    audit_event_codes and audit_match_filters apply to the "evaka-audit" format,
+    which reports the audit entries a source names instead of scanning for
+    errors. Each source is one rule: the event codes to report, and optional
+    raw Insights filter lines that narrow which of them matter.
+
     channel overrides the account's Slack channel for this source alone, for a
     source whose volume belongs somewhere other than the app's own channel.
   EOT
@@ -73,18 +78,25 @@ variable "log_sources" {
     format                    = string
     throw_site_package_prefix = optional(string, "")
     extra_noise_filters       = optional(list(string), [])
+    audit_event_codes         = optional(list(string), [])
+    audit_match_filters       = optional(list(string), [])
     channel                   = optional(string)
   }))
   default = {}
 
   validation {
-    condition     = alltrue([for s in var.log_sources : contains(["logback-json", "pino-json", "nginx", "ssm-session-audit"], s.format)])
-    error_message = "log_sources[*].format must be \"logback-json\", \"pino-json\", \"nginx\" or \"ssm-session-audit\"."
+    condition     = alltrue([for s in var.log_sources : contains(["logback-json", "pino-json", "nginx", "ssm-session-audit", "evaka-audit"], s.format)])
+    error_message = "log_sources[*].format must be \"logback-json\", \"pino-json\", \"nginx\", \"ssm-session-audit\" or \"evaka-audit\"."
   }
 
   validation {
     condition     = alltrue([for s in var.log_sources : length(s.log_group_names) > 0 || length(s.log_group_name_prefixes) > 0])
     error_message = "Each log_sources entry needs at least one of log_group_names or log_group_name_prefixes."
+  }
+
+  validation {
+    condition     = alltrue([for s in var.log_sources : s.format != "evaka-audit" || length(s.audit_event_codes) > 0])
+    error_message = "A log_sources entry with format \"evaka-audit\" needs at least one audit_event_codes value: without one it would match every audit entry."
   }
 }
 
