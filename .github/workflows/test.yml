@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        module: [slack-notifier, waf]
+        module: [slack-notifier, waf, ops-metrics]
     steps:
       - uses: actions/checkout@v7
       - uses: hashicorp/setup-terraform@v4
