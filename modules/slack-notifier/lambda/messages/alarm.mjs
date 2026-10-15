@@ -2,7 +2,7 @@
 // alarm into a Slack card with a deep link. Matched by the presence of
 // AlarmName in the parsed message.
 
-import { consoleDomain, formatTimestamp } from '../lib.mjs'
+import { buildAlarmConsoleUrl, formatTimestamp } from '../lib.mjs'
 
 export function buildAlarmPayload(message, region, partition = 'aws') {
   const alarmName = message.AlarmName ?? 'Unknown alarm'
@@ -14,9 +14,7 @@ export function buildAlarmPayload(message, region, partition = 'aws') {
   const color = newState === 'ALARM' ? '#d32f2f' : '#4caf50'
   const emoji = newState === 'ALARM' ? ':red_circle:' : ':large_green_circle:'
 
-  const consoleUrl =
-    `https://${region}.console.${consoleDomain(partition)}/cloudwatch/deeplink.js` +
-    `?region=${region}#alarmsV2:alarm/${encodeURIComponent(alarmName)}`
+  const consoleUrl = buildAlarmConsoleUrl(alarmName, region, partition)
 
   // Headline: prefer a human-readable AlarmDescription (e.g. "Backup failed in
   // evaka-staging"); otherwise fall back to the technical alarm name and state.

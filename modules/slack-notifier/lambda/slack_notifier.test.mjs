@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import { ssmStub } from './stub-ssm.mjs'
 import { cloudwatchLogsStub } from './stub-cloudwatch-logs.mjs'
+import { cloudwatchStub } from './stub-cloudwatch.mjs'
 
 // Set AWS_REGION before importing the module to avoid side-effect issues
 // and to get deterministic URLs in buildLogInsightsUrl tests.
@@ -15,6 +16,11 @@ const {
   buildAlarmPayload,
   buildNotificationPayload,
   buildSessionDigestPayload,
+  buildAlarmReminderPayload,
+  listActiveAlarms,
+  formatDateTime,
+  formatDuration,
+  buildAlarmConsoleUrl,
   buildAuditQuery,
   buildAuditEventPayload,
   resolveMatchedCount,
@@ -1714,5 +1720,296 @@ describe('handler on a scheduled event', () => {
       posted[0].attachments[0].blocks[0].text.text,
       /Audit event scan for "admin-granted" failed after 1 attempts in \d+ms \(last status: Failed\)/
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// formatDateTime / formatDuration
+// ---------------------------------------------------------------------------
+describe('formatDateTime', () => {
+  it('renders date and time in Helsinki time', () => {
+    assert.equal(
+      formatDateTime(new Date('2026-10-13T00:12:00Z')),
+      '2026-10-13 03:12'
+    )
+  })
+
+  it('accepts an ISO string and passes an unparseable value through', () => {
+    assert.equal(formatDateTime('2026-01-13T00:12:00Z'), '2026-01-13 02:12')
+    assert.equal(formatDateTime('not a date'), 'not a date')
+  })
+})
+
+describe('formatDuration', () => {
+  it('shows the two largest units that apply', () => {
+    assert.equal(formatDuration(5 * 60_000), '5 min')
+    assert.equal(formatDuration(60 * 60_000), '1 h')
+    assert.equal(formatDuration(125 * 60_000), '2 h 5 min')
+    assert.equal(formatDuration(24 * 60 * 60_000), '1 d')
+    assert.equal(
+      formatDuration((3 * 24 * 60 + 4 * 60 + 30) * 60_000),
+      '3 d 4 h'
+    )
+  })
+
+  it('never goes negative for a timestamp slightly in the future', () => {
+    assert.equal(formatDuration(-30_000), '0 min')
+  })
+})
+
+describe('buildAlarmConsoleUrl', () => {
+  it('builds the deep link for the partition', () => {
+    assert.equal(
+      buildAlarmConsoleUrl('a b', 'eusc-de-east-1', 'aws-eusc'),
+      'https://eusc-de-east-1.console.amazonaws-eusc.eu/cloudwatch/deeplink.js?region=eusc-de-east-1#alarmsV2:alarm/a%20b'
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Alarm reminder
+// ---------------------------------------------------------------------------
+const TOPIC_ARN = 'arn:aws:sns:eu-west-1:123456789012:voltti-cloudwatch-alarms'
+
+function redAlarm(name, overrides = {}) {
+  return {
+    AlarmName: name,
+    AlarmActions: [TOPIC_ARN],
+    StateValue: 'ALARM',
+    StateTransitionedTimestamp: new Date('2026-10-13T00:12:00Z'),
+    ...overrides
+  }
+}
+
+describe('buildAlarmReminderPayload', () => {
+  const now = new Date('2026-10-15T05:00:00Z')
+
+  it('lists each alarm with a console link, description and age', () => {
+    const payload = buildAlarmReminderPayload(
+      [
+        redAlarm('example-prod-rds-cpu', {
+          AlarmDescription: 'RDS CPU is high'
+        }),
+        redAlarm('example-prod-no-description', {
+          StateTransitionedTimestamp: new Date('2026-10-15T03:50:00Z')
+        })
+      ],
+      'eu-west-1',
+      'aws',
+      now
+    )
+
+    const blocks = payload.attachments[0].blocks
+    assert.equal(payload.attachments[0].color, '#d32f2f')
+    assert.equal(
+      blocks[0].text.text,
+      ':red_circle: *2 alarms still in ALARM state*'
+    )
+    const lines = blocks[1].text.text.split('\n')
+    assert.equal(
+      lines[0],
+      '• <https://eu-west-1.console.aws.amazon.com/cloudwatch/deeplink.js?region=eu-west-1#alarmsV2:alarm/example-prod-rds-cpu|example-prod-rds-cpu> — RDS CPU is high _(since 2026-10-13 03:12, 2 d 4 h)_'
+    )
+    assert.equal(
+      lines[1],
+      '• <https://eu-west-1.console.aws.amazon.com/cloudwatch/deeplink.js?region=eu-west-1#alarmsV2:alarm/example-prod-no-description|example-prod-no-description> _(since 2026-10-15 06:50, 1 h 10 min)_'
+    )
+    assert.equal(blocks[2].type, 'context')
+  })
+
+  it('uses the singular for one alarm and omits the age without a timestamp', () => {
+    const payload = buildAlarmReminderPayload(
+      [
+        redAlarm('one', {
+          StateTransitionedTimestamp: undefined,
+          StateUpdatedTimestamp: undefined
+        })
+      ],
+      'eu-west-1',
+      'aws',
+      now
+    )
+    const blocks = payload.attachments[0].blocks
+    assert.equal(
+      blocks[0].text.text,
+      ':red_circle: *1 alarm still in ALARM state*'
+    )
+    assert.ok(!blocks[1].text.text.includes('since'))
+  })
+
+  it('caps the list and says how many were left out', () => {
+    const alarms = Array.from({ length: 30 }, (_, i) => redAlarm(`alarm-${i}`))
+    const payload = buildAlarmReminderPayload(alarms, 'eu-west-1', 'aws', now)
+    const lines = payload.attachments[0].blocks[1].text.text.split('\n')
+    assert.equal(lines.length, 26)
+    assert.equal(lines[25], '_...and 5 more not shown_')
+  })
+})
+
+describe('listActiveAlarms', () => {
+  beforeEach(() => cloudwatchStub.reset())
+
+  it('asks for red alarms of both types routed to the topic, across pages', async () => {
+    cloudwatchStub.describeAlarmsResponses = [
+      { MetricAlarms: [redAlarm('metric-1')], NextToken: 'page-2' },
+      { CompositeAlarms: [redAlarm('composite-1')] }
+    ]
+
+    const alarms = await listActiveAlarms(TOPIC_ARN)
+
+    assert.deepEqual(
+      alarms.map((a) => a.AlarmName),
+      ['metric-1', 'composite-1']
+    )
+    assert.equal(cloudwatchStub.calls.length, 2)
+    assert.deepEqual(cloudwatchStub.calls[0].input, {
+      StateValue: 'ALARM',
+      ActionPrefix: TOPIC_ARN,
+      AlarmTypes: ['CompositeAlarm', 'MetricAlarm'],
+      NextToken: undefined
+    })
+    assert.equal(cloudwatchStub.calls[1].input.NextToken, 'page-2')
+  })
+
+  // ActionPrefix is a prefix match, so the API also returns alarms routed to
+  // a topic whose name merely begins with ours.
+  it('drops an alarm whose action only prefix-matches the topic', async () => {
+    cloudwatchStub.describeAlarmsResponses = [
+      {
+        MetricAlarms: [
+          redAlarm('ours'),
+          redAlarm('theirs', { AlarmActions: [`${TOPIC_ARN}-other`] }),
+          redAlarm('no-actions', { AlarmActions: undefined })
+        ]
+      }
+    ]
+
+    const alarms = await listActiveAlarms(TOPIC_ARN)
+    assert.deepEqual(
+      alarms.map((a) => a.AlarmName),
+      ['ours']
+    )
+  })
+
+  it('orders the longest-standing alarm first', async () => {
+    cloudwatchStub.describeAlarmsResponses = [
+      {
+        MetricAlarms: [
+          redAlarm('newer', {
+            StateTransitionedTimestamp: new Date('2026-10-15T00:00:00Z')
+          }),
+          redAlarm('unknown-age', {
+            StateTransitionedTimestamp: undefined,
+            StateUpdatedTimestamp: undefined
+          }),
+          redAlarm('older', {
+            StateTransitionedTimestamp: new Date('2026-10-01T00:00:00Z')
+          })
+        ]
+      }
+    ]
+
+    const alarms = await listActiveAlarms(TOPIC_ARN)
+    assert.deepEqual(
+      alarms.map((a) => a.AlarmName),
+      ['older', 'newer', 'unknown-age']
+    )
+  })
+})
+
+describe('handler on an alarm-reminder event', () => {
+  let originalFetch
+  let originalLog
+  let originalError
+  let posted
+
+  const context = {
+    invokedFunctionArn:
+      'arn:aws:lambda:eu-west-1:123456789012:function:test-slack-notifier'
+  }
+  const event = { action: 'alarm-reminder' }
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+    originalLog = console.log
+    originalError = console.error
+    console.log = () => {}
+    console.error = () => {}
+    posted = []
+    globalThis.fetch = async (_url, init) => {
+      posted.push(JSON.parse(init.body))
+      return { ok: true, status: 200 }
+    }
+    ssmStub.reset()
+    cloudwatchStub.reset()
+    cloudwatchLogsStub.reset()
+    process.env.ALARM_SNS_TOPIC_ARN = TOPIC_ARN
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    console.log = originalLog
+    console.error = originalError
+    delete process.env.ALARM_SNS_TOPIC_ARN
+  })
+
+  it('posts one message listing the red alarms and reports the count', async () => {
+    cloudwatchStub.describeAlarmsResponses = [
+      { MetricAlarms: [redAlarm('a'), redAlarm('b')] }
+    ]
+    const { handler } = await freshModule()
+
+    const result = await handler(event, context)
+
+    assert.deepEqual(result, { alarmCount: 2, posted: true })
+    assert.equal(posted.length, 1)
+    assert.ok(
+      posted[0].attachments[0].blocks[0].text.text.includes(
+        '2 alarms still in ALARM state'
+      )
+    )
+    assert.equal(
+      cloudwatchLogsStub.calls.length,
+      0,
+      'the reminder must not start the log scans'
+    )
+  })
+
+  // A daily "all clear" would be noise; the count is for a manual invocation.
+  it('posts nothing when no alarm is red', async () => {
+    cloudwatchStub.describeAlarmsResponses = [{ MetricAlarms: [] }]
+    const { handler } = await freshModule()
+
+    const result = await handler(event, context)
+
+    assert.deepEqual(result, { alarmCount: 0, posted: false })
+    assert.equal(posted.length, 0)
+  })
+
+  // Silence after a failed listing would read as all clear.
+  it('warns Slack when the alarms cannot be listed', async () => {
+    cloudwatchStub.describeAlarmsError = new Error('AccessDeniedException')
+    const { handler } = await freshModule()
+
+    const result = await handler(event, context)
+
+    assert.equal(result.posted, false)
+    assert.equal(result.alarmCount, null)
+    assert.ok(result.error.includes('AccessDeniedException'))
+    assert.equal(posted.length, 1)
+    const text = posted[0].attachments[0].blocks[0].text.text
+    assert.ok(text.includes('*Alarm reminder failed*'))
+    assert.ok(text.includes('the alarm reminder could not be run'))
+  })
+
+  it('does nothing without a topic to filter on', async () => {
+    delete process.env.ALARM_SNS_TOPIC_ARN
+    const { handler } = await freshModule()
+
+    const result = await handler(event, context)
+
+    assert.deepEqual(result, { alarmCount: 0, posted: false })
+    assert.equal(cloudwatchStub.calls.length, 0)
+    assert.equal(posted.length, 0)
   })
 })

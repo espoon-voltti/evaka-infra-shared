@@ -2,8 +2,9 @@
 // file, are loaded here and looped over:
 //   - messages/ : SNS payloads (a CloudWatch alarm, or a plain notification),
 //                 matched by a predicate.
-//   - checks/   : scheduled Logs Insights scans, dispatched by a source's
-//                 `format`.
+//   - checks/   : scheduled checks. Logs Insights scans are dispatched by a
+//                 source's `format`; the alarm reminder by the event's `action`,
+//                 which is also what a manual invocation sends.
 // Adding an alert is a new file plus one import line below, not a branch here.
 
 import {
@@ -17,6 +18,7 @@ import {
 import logError from './checks/log-error.mjs'
 import sessionAudit from './checks/session-audit.mjs'
 import auditEvent from './checks/audit-event.mjs'
+import alarmReminder from './checks/alarm-reminder.mjs'
 import alarm from './messages/alarm.mjs'
 import notification from './messages/notification.mjs'
 
@@ -36,7 +38,9 @@ const LOG_SOURCES = JSON.parse(process.env.LOG_SOURCES_JSON ?? '{}')
 export async function handler(event, context) {
   const partition = context.invokedFunctionArn.split(':')[1]
 
-  if ('Records' in event) {
+  if (event.action === alarmReminder.action) {
+    return runReminder(partition)
+  } else if ('Records' in event) {
     for (const record of event.Records) {
       try {
         await handleSnsRecord(record, partition)
@@ -123,10 +127,26 @@ async function handleLogSourceCheck(sourceName, source, partition) {
   }
 }
 
-async function reportScanFailure(label, err) {
+async function runReminder(partition) {
+  try {
+    return await alarmReminder.run(partition)
+  } catch (err) {
+    await reportScanFailure('the alarm reminder', err, 'Alarm reminder failed')
+    return {
+      alarmCount: null,
+      posted: false,
+      error: String(err.message ?? err)
+    }
+  }
+}
+
+async function reportScanFailure(label, err, headline) {
   console.error(`Failed to run ${label}:`, err)
   try {
-    await warnSlack(`${label} could not be run: ${err.message ?? err}`)
+    await warnSlack(
+      `${label} could not be run: ${err.message ?? err}`,
+      headline
+    )
   } catch (warnErr) {
     console.error(`Failed to warn Slack about ${label}:`, warnErr)
   }
@@ -148,6 +168,9 @@ export {
   getSlackWebhookUrl,
   postToSlack,
   formatTimestamp,
+  formatDateTime,
+  formatDuration,
+  buildAlarmConsoleUrl,
   discoverLogGroupNames,
   resolveSourceLogGroupNames,
   deriveSourceLabel,
@@ -166,6 +189,10 @@ export {
   DJANGO_PRESET
 } from './checks/log-error.mjs'
 export { buildSessionDigestPayload } from './checks/session-audit.mjs'
+export {
+  listActiveAlarms,
+  buildAlarmReminderPayload
+} from './checks/alarm-reminder.mjs'
 export {
   buildAuditQuery,
   buildAuditEventPayload

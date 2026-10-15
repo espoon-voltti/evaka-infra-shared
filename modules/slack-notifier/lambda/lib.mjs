@@ -83,7 +83,7 @@ export async function postToSlack(payload, channelOverride) {
   cachedWebhookUrl = webhookUrl
 }
 
-export async function warnSlack(reason) {
+export async function warnSlack(reason, headline = 'Log error check failed') {
   await postToSlack({
     attachments: [
       {
@@ -93,7 +93,7 @@ export async function warnSlack(reason) {
             type: 'section',
             text: {
               type: 'mrkdwn',
-              text: `:warning: *Log error check failed* — ${reason}`
+              text: `:warning: *${headline}* — ${reason}`
             }
           }
         ]
@@ -110,6 +110,13 @@ export function consoleDomain(partition) {
   return partition === 'aws-eusc' ? 'amazonaws-eusc.eu' : 'aws.amazon.com'
 }
 
+export function buildAlarmConsoleUrl(alarmName, region, partition = 'aws') {
+  return (
+    `https://${region}.console.${consoleDomain(partition)}/cloudwatch/deeplink.js` +
+    `?region=${region}#alarmsV2:alarm/${encodeURIComponent(alarmName)}`
+  )
+}
+
 export function formatTimestamp(isoString) {
   const date = new Date(isoString)
   if (isNaN(date.getTime())) return isoString
@@ -119,6 +126,33 @@ export function formatTimestamp(isoString) {
     minute: '2-digit',
     second: '2-digit'
   })
+}
+
+// Date and time, for an event that may be days old where the time alone would
+// not say which day. sv-SE is the locale whose format is ISO-like.
+export function formatDateTime(date) {
+  const parsed = date instanceof Date ? date : new Date(date)
+  if (isNaN(parsed.getTime())) return String(date)
+  return parsed.toLocaleString('sv-SE', {
+    timeZone: 'Europe/Helsinki',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+}
+
+export function formatDuration(ms) {
+  const minutes = Math.max(0, Math.floor(ms / 60_000))
+  const days = Math.floor(minutes / 1440)
+  const hours = Math.floor((minutes % 1440) / 60)
+  if (days > 0) return hours > 0 ? `${days} d ${hours} h` : `${days} d`
+  if (hours > 0) {
+    const rest = minutes % 60
+    return rest > 0 ? `${hours} h ${rest} min` : `${hours} h`
+  }
+  return `${minutes} min`
 }
 
 export function buildLogInsightsUrl(
