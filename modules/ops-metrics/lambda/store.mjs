@@ -48,24 +48,46 @@ export function dayKeysForRange(fromMs, toMs) {
   return keys
 }
 
-export function splitByUtcDay(fromMs, toMs) {
+// Chunks end at multiples of chunkMs since the epoch, so a chunkMs that
+// divides a day never crosses a UTC midnight.
+export function splitIntoChunks(fromMs, toMs, chunkMs) {
   const chunks = []
   for (let start = fromMs; start < toMs; ) {
-    const end = Math.min(utcDayStart(start) + DAY_MS, toMs)
+    const end = Math.min(Math.floor(start / chunkMs) * chunkMs + chunkMs, toMs)
     chunks.push({ fromMs: start, toMs: end })
     start = end
   }
   return chunks
 }
 
+// A histogram has a count below the first bound, one between each two bounds,
+// and one at or above the last bound.
+function histogramSize(meta) {
+  return meta.bounds.length + 1
+}
+
+function zeroValue(meta) {
+  switch (meta.type) {
+    case 'counter':
+      return 0
+    case 'histogram':
+      return new Array(histogramSize(meta)).fill(0)
+    default:
+      throw new Error(`A ${meta.type} series has no zero value`)
+  }
+}
+
 // Logs Insights returns no row for a count of zero. Inside a processed range a
-// missing counter means zero, and only outside it does a missing key mean
-// that the value is not known.
-export function zeroFill(valuesByTime, starts, counters) {
+// missing counter or histogram means zero, and only outside it does a missing
+// key mean that the value is not known. `series` maps each name to fill to its
+// metadata.
+export function zeroFill(valuesByTime, starts, series) {
   const filled = new Map(valuesByTime)
   for (const t of starts) {
     const values = { ...filled.get(t) }
-    for (const name of counters) values[name] ??= 0
+    for (const [name, meta] of Object.entries(series)) {
+      values[name] ??= zeroValue(meta)
+    }
     filled.set(t, values)
   }
   return filled

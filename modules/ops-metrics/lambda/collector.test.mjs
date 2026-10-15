@@ -12,27 +12,32 @@ process.env.RDS_INSTANCE_IDENTIFIER = 'evaka-staging'
 delete process.env.INGESTION_DELAY_SECONDS
 
 const {
-  LOGIN_QUERY,
-  LOGIN_SERIES_BY_EVENT_CODE,
   METRICS_LOOKBACK_MS,
   backfillRange,
   groupByDay,
   handler,
-  loginCountsFromRows,
   mergeValues,
   latestClosedEnd,
   scheduledRange,
   summariesToValues
 } = await import('./collector.mjs')
+const { DAY_MS } = await import('./store.mjs')
+const { SERVICE_SERIES } = await import('./queries.mjs')
 
 const ms = (iso) => Date.parse(iso)
 const STRONG = 'citizen.login{auth=strong}'
 const WEAK = 'citizen.login{auth=weak}'
 
+// A result row of the service query for an audit event.
 function insightsRow(t, eventCode, n) {
   return [
     { field: 't', value: t },
-    { field: 'eventCode', value: eventCode },
+    { field: 'type', value: 'app-audit-events' },
+    { field: 'k', value: eventCode },
+    { field: 'level', value: '-' },
+    { field: 'kind', value: '-' },
+    { field: 'jobType', value: '-' },
+    { field: 'rt', value: '0' },
     { field: 'n', value: String(n) }
   ]
 }
@@ -92,24 +97,6 @@ function metricRanges() {
   ])
 }
 
-describe('LOGIN_QUERY', () => {
-  it('is the query of the spec', () => {
-    assert.equal(
-      LOGIN_QUERY,
-      [
-        'fields @timestamp',
-        '| filter type = "app-audit-events" and eventCode in ["CitizenLogin", "CitizenWeakLogin", "CitizenPasskeyLogin"]',
-        '| stats count() as n by bin(5m) as t, eventCode'
-      ].join('\n')
-    )
-  })
-
-  it('filters by every event code that maps to a login series', () => {
-    const codes = JSON.parse(/eventCode in (\[[^\]]*\])/.exec(LOGIN_QUERY)[1])
-    assert.deepEqual(codes, Object.keys(LOGIN_SERIES_BY_EVENT_CODE))
-  })
-})
-
 describe('latestClosedEnd', () => {
   it('is the end of the last bucket that closed at least the delay ago', () => {
     assert.equal(
@@ -127,36 +114,36 @@ describe('scheduledRange', () => {
   const end = ms('2026-10-06T12:00:00Z')
 
   it('starts at the watermark', () => {
-    assert.deepEqual(scheduledRange(ms('2026-10-06T11:55:00Z'), end, 0), {
-      fromMs: ms('2026-10-06T11:55:00Z'),
-      toMs: end
-    })
+    assert.deepEqual(
+      scheduledRange(ms('2026-10-06T11:55:00Z'), end, 0, DAY_MS),
+      { fromMs: ms('2026-10-06T11:55:00Z'), toMs: end }
+    )
   })
 
   it('is only the latest closed bucket without a watermark', () => {
-    assert.deepEqual(scheduledRange(NaN, end, 0), {
+    assert.deepEqual(scheduledRange(NaN, end, 0, DAY_MS), {
       fromMs: ms('2026-10-06T11:55:00Z'),
       toMs: end
     })
   })
 
   it('is empty when the watermark is at the end', () => {
-    const { fromMs, toMs } = scheduledRange(end, end, 0)
+    const { fromMs, toMs } = scheduledRange(end, end, 0, DAY_MS)
     assert.equal(fromMs, toMs)
   })
 
   it('starts at the lookback when the watermark is later', () => {
-    assert.deepEqual(scheduledRange(end, end, METRICS_LOOKBACK_MS), {
+    assert.deepEqual(scheduledRange(end, end, METRICS_LOOKBACK_MS, DAY_MS), {
       fromMs: ms('2026-10-06T11:30:00Z'),
       toMs: end
     })
   })
 
-  it('covers at most one day', () => {
-    assert.deepEqual(scheduledRange(ms('2026-10-01T00:00:00Z'), end, 0), {
-      fromMs: ms('2026-10-01T00:00:00Z'),
-      toMs: ms('2026-10-02T00:00:00Z')
-    })
+  it('covers at most the longest range of the source', () => {
+    assert.deepEqual(
+      scheduledRange(ms('2026-10-01T00:00:00Z'), end, 0, DAY_MS / 2),
+      { fromMs: ms('2026-10-01T00:00:00Z'), toMs: ms('2026-10-01T12:00:00Z') }
+    )
   })
 })
 
@@ -190,53 +177,6 @@ describe('backfillRange', () => {
       () => backfillRange({ from: 'x', to: '2026-10-07T00:00:00Z' }, now, 0),
       /Invalid backfill range/
     )
-  })
-})
-
-describe('loginCountsFromRows', () => {
-  const from = ms('2026-10-06T00:00:00Z')
-  const to = ms('2026-10-06T00:15:00Z')
-
-  it('adds the weak login codes together and zero-fills the empty buckets', () => {
-    const counts = loginCountsFromRows(
-      [
-        { t: '2026-10-06 00:00:00.000', eventCode: 'CitizenLogin', n: '12' },
-        { t: '2026-10-06 00:00:00.000', eventCode: 'CitizenWeakLogin', n: '2' },
-        {
-          t: '2026-10-06 00:00:00.000',
-          eventCode: 'CitizenPasskeyLogin',
-          n: '1'
-        },
-        { t: '2026-10-06 00:10:00.000', eventCode: 'CitizenWeakLogin', n: '4' }
-      ],
-      from,
-      to
-    )
-    assert.deepEqual(
-      [...counts],
-      [
-        [ms('2026-10-06T00:00:00Z'), { [STRONG]: 12, [WEAK]: 3 }],
-        [ms('2026-10-06T00:10:00Z'), { [WEAK]: 4, [STRONG]: 0 }],
-        [ms('2026-10-06T00:05:00Z'), { [STRONG]: 0, [WEAK]: 0 }]
-      ]
-    )
-  })
-
-  it('drops rows outside the range and unknown event codes', () => {
-    const counts = loginCountsFromRows(
-      [
-        { t: '2026-10-06 00:15:00.000', eventCode: 'CitizenLogin', n: '1' },
-        { t: '2026-10-06 00:05:00.000', eventCode: 'EmployeeLogin', n: '1' }
-      ],
-      from,
-      to
-    )
-    assert.equal(counts.size, 3)
-    assert.equal(counts.has(ms('2026-10-06T00:15:00Z')), false)
-    assert.deepEqual(counts.get(ms('2026-10-06T00:05:00Z')), {
-      [STRONG]: 0,
-      [WEAK]: 0
-    })
   })
 })
 
@@ -300,7 +240,7 @@ describe('handler', () => {
     const result = await runScheduled('2026-10-06T12:06:00Z')
 
     assert.deepEqual(result, {
-      logs: { from: '2026-10-06T11:55:00Z', to: '2026-10-06T12:00:00Z' },
+      service: { from: '2026-10-06T11:55:00Z', to: '2026-10-06T12:00:00Z' },
       metrics: { from: '2026-10-06T11:30:00Z', to: '2026-10-06T12:00:00Z' }
     })
     assert.deepEqual(logQueryRanges(), [
@@ -318,34 +258,35 @@ describe('handler', () => {
       { Name: 'DBInstanceIdentifier', Value: 'evaka-staging' }
     ])
     assert.deepEqual(storedState(), {
-      logs: '2026-10-06T12:00:00Z',
+      service: '2026-10-06T12:00:00Z',
       metrics: '2026-10-06T12:00:00Z'
     })
 
     const day = storedDay('5min/2026/10/06.json')
-    assert.deepEqual(day.series, {
-      [STRONG]: { type: 'counter' },
-      [WEAK]: { type: 'counter' },
-      'rds.cpu': { type: 'gaugeSummary' }
+    assert.deepEqual(
+      Object.keys(day.series).sort(),
+      [...SERVICE_SERIES, 'rds.cpu'].sort()
+    )
+    assert.deepEqual(day.series[STRONG], { type: 'counter' })
+    assert.deepEqual(day.series['rds.cpu'], { type: 'gaugeSummary' })
+    // The service series are zero-filled only in the bucket that the query
+    // covered.
+    const cpu = { min: 20, mean: 20, max: 20, n: 5 }
+    assert.deepEqual(day.slots[0], {
+      t: '2026-10-06T11:30:00Z',
+      'rds.cpu': cpu
     })
-    // Logins are zero-filled only in the bucket that the query covered.
-    assert.deepEqual(day.slots, [
-      {
-        t: '2026-10-06T11:30:00Z',
-        'rds.cpu': { min: 20, mean: 20, max: 20, n: 5 }
-      },
-      {
-        t: '2026-10-06T11:55:00Z',
-        [STRONG]: 4,
-        [WEAK]: 0,
-        'rds.cpu': { min: 20, mean: 20, max: 20, n: 5 }
-      }
-    ])
+    assert.equal(day.slots.length, 2)
+    assert.equal(day.slots[1].t, '2026-10-06T11:55:00Z')
+    assert.equal(day.slots[1][STRONG], 4)
+    assert.equal(day.slots[1][WEAK], 0)
+    assert.deepEqual(day.slots[1]['rds.cpu'], cpu)
+    assert.equal(Object.keys(day.slots[1]).length, SERVICE_SERIES.length + 2)
   })
 
   it('processes one bucket after the watermark on a normal run', async () => {
     setStoredState({
-      logs: '2026-10-06T12:00:00Z',
+      service: '2026-10-06T12:00:00Z',
       metrics: '2026-10-06T12:00:00Z'
     })
     queueEmptyQueryResults(1)
@@ -359,18 +300,51 @@ describe('handler', () => {
       ['2026-10-06T11:35:00Z', '2026-10-06T12:05:00Z']
     ])
     assert.deepEqual(storedState(), {
-      logs: '2026-10-06T12:05:00Z',
+      service: '2026-10-06T12:05:00Z',
       metrics: '2026-10-06T12:05:00Z'
     })
     const day = storedDay('5min/2026/10/06.json')
-    assert.deepEqual(day.slots, [
-      { t: '2026-10-06T12:00:00Z', [STRONG]: 0, [WEAK]: 0 }
-    ])
+    assert.deepEqual(
+      day.slots.map((slot) => [slot.t, slot[STRONG], slot[WEAK]]),
+      [['2026-10-06T12:00:00Z', 0, 0]]
+    )
+  })
+
+  it('stores the metadata of a job type series found in the rows', async () => {
+    setStoredState({
+      service: '2026-10-06T12:00:00Z',
+      metrics: '2026-10-06T12:00:00Z'
+    })
+    cloudwatchLogsStub.queryResults = [
+      {
+        status: 'Complete',
+        results: [
+          [
+            { field: 't', value: '2026-10-06 12:00:00.000' },
+            { field: 'type', value: 'app-misc' },
+            { field: 'k', value: '-' },
+            { field: 'level', value: 'WARN' },
+            { field: 'kind', value: 'Failed to run async job' },
+            { field: 'jobType', value: 'SendMessage' },
+            { field: 'rt', value: '0' },
+            { field: 'n', value: '2' }
+          ]
+        ]
+      }
+    ]
+
+    await runScheduled('2026-10-06T12:11:00Z')
+
+    const day = storedDay('5min/2026/10/06.json')
+    const series = 'service.asyncJob.failed{type=SendMessage}'
+    assert.deepEqual(day.series[series], { type: 'counter' })
+    assert.equal(day.slots[0][series], 2)
+    assert.equal(day.slots[0]['service.asyncJob.failed'], 2)
   })
 
   it('runs no Insights query when no bucket closed after the watermark', async () => {
     setStoredState({
-      logs: '2026-10-06T12:00:00Z',
+      service: '2026-10-06T12:00:00Z',
       metrics: '2026-10-06T12:00:00Z'
     })
 
@@ -380,12 +354,12 @@ describe('handler', () => {
       metrics: { from: '2026-10-06T11:30:00Z', to: '2026-10-06T12:00:00Z' }
     })
     assert.deepEqual(logQueryRanges(), [])
-    assert.equal(storedState().logs, '2026-10-06T12:00:00Z')
+    assert.equal(storedState().service, '2026-10-06T12:00:00Z')
   })
 
   it('catches up a 3-hour outage in one query', async () => {
     setStoredState({
-      logs: '2026-10-06T09:00:00Z',
+      service: '2026-10-06T09:00:00Z',
       metrics: '2026-10-06T09:00:00Z'
     })
     queueEmptyQueryResults(1)
@@ -399,90 +373,90 @@ describe('handler', () => {
       ['2026-10-06T09:00:00Z', '2026-10-06T12:00:00Z']
     ])
     assert.deepEqual(storedState(), {
-      logs: '2026-10-06T12:00:00Z',
+      service: '2026-10-06T12:00:00Z',
       metrics: '2026-10-06T12:00:00Z'
     })
     assert.equal(storedDay('5min/2026/10/06.json').slots.length, 36)
   })
 
-  it('catches up an outage longer than a day one day per run', async () => {
+  it('catches up an outage one range of each source per run', async () => {
     setStoredState({
-      logs: '2026-10-04T12:00:00Z',
-      metrics: '2026-10-04T12:00:00Z'
+      service: '2026-10-05T06:00:00Z',
+      metrics: '2026-10-05T06:00:00Z'
     })
 
-    queueEmptyQueryResults(2)
+    queueEmptyQueryResults(1)
     await runScheduled('2026-10-06T12:06:00Z')
     assert.deepEqual(storedState(), {
-      logs: '2026-10-05T12:00:00Z',
-      metrics: '2026-10-05T12:00:00Z'
+      service: '2026-10-05T18:00:00Z',
+      metrics: '2026-10-06T06:00:00Z'
     })
 
-    queueEmptyQueryResults(2)
+    queueEmptyQueryResults(1)
     await runScheduled('2026-10-06T12:11:00Z')
     assert.deepEqual(storedState(), {
-      logs: '2026-10-06T12:00:00Z',
-      metrics: '2026-10-06T12:00:00Z'
+      service: '2026-10-06T06:00:00Z',
+      metrics: '2026-10-06T12:05:00Z'
     })
 
     queueEmptyQueryResults(1)
     await runScheduled('2026-10-06T12:16:00Z')
     assert.deepEqual(storedState(), {
-      logs: '2026-10-06T12:10:00Z',
+      service: '2026-10-06T12:10:00Z',
       metrics: '2026-10-06T12:10:00Z'
     })
 
     assert.deepEqual(logQueryRanges(), [
-      ['2026-10-04T12:00:00Z', '2026-10-05T00:00:00Z'],
-      ['2026-10-05T00:00:00Z', '2026-10-05T12:00:00Z'],
-      ['2026-10-05T12:00:00Z', '2026-10-06T00:00:00Z'],
-      ['2026-10-06T00:00:00Z', '2026-10-06T12:00:00Z'],
-      ['2026-10-06T12:00:00Z', '2026-10-06T12:10:00Z']
+      ['2026-10-05T06:00:00Z', '2026-10-05T18:00:00Z'],
+      ['2026-10-05T18:00:00Z', '2026-10-06T06:00:00Z'],
+      ['2026-10-06T06:00:00Z', '2026-10-06T12:10:00Z']
     ])
-    assert.equal(storedDay('5min/2026/10/04.json').slots.length, 144)
-    assert.equal(storedDay('5min/2026/10/05.json').slots.length, 288)
+    assert.deepEqual(metricRanges(), [
+      ['2026-10-05T06:00:00Z', '2026-10-06T06:00:00Z'],
+      ['2026-10-06T06:00:00Z', '2026-10-06T12:05:00Z'],
+      ['2026-10-06T11:40:00Z', '2026-10-06T12:10:00Z']
+    ])
+    assert.equal(storedDay('5min/2026/10/05.json').slots.length, 216)
     assert.equal(storedDay('5min/2026/10/06.json').slots.length, 146)
   })
 
-  it('stops before a day when the time runs low and continues on the next run', async () => {
+  it('stops before a source when the time runs low and continues on the next run', async () => {
     setStoredState({
-      logs: '2026-10-05T12:00:00Z',
+      service: '2026-10-06T12:00:00Z',
       metrics: '2026-10-06T12:00:00Z'
     })
     queueEmptyQueryResults(1)
-    const remaining = [300_000, 59_999, 59_999]
+    const remaining = [300_000, 59_999]
 
-    await runScheduled(
-      '2026-10-06T12:06:00Z',
+    const result = await runScheduled(
+      '2026-10-06T12:11:00Z',
       context(() => remaining.shift())
     )
-    assert.deepEqual(logQueryRanges(), [
-      ['2026-10-05T12:00:00Z', '2026-10-06T00:00:00Z']
-    ])
+    assert.deepEqual(Object.keys(result), ['service'])
+    assert.deepEqual(metricRanges(), [])
     assert.deepEqual(storedState(), {
-      logs: '2026-10-06T00:00:00Z',
+      service: '2026-10-06T12:05:00Z',
       metrics: '2026-10-06T12:00:00Z'
     })
 
     queueEmptyQueryResults(1)
-    await runScheduled('2026-10-06T12:11:00Z')
-    assert.deepEqual(logQueryRanges().at(-1), [
-      '2026-10-06T00:00:00Z',
-      '2026-10-06T12:05:00Z'
+    await runScheduled('2026-10-06T12:16:00Z')
+    assert.deepEqual(metricRanges(), [
+      ['2026-10-06T11:40:00Z', '2026-10-06T12:10:00Z']
     ])
   })
 
   it('keeps the watermark of a failed source and advances the other', async () => {
     setStoredState({
-      logs: '2026-10-06T12:00:00Z',
+      service: '2026-10-06T12:00:00Z',
       metrics: '2026-10-06T12:00:00Z'
     })
     cloudwatchLogsStub.queryResults = [{ status: 'Failed' }]
     cloudwatchStub.responses = [metricData(['2026-10-06T12:00:00Z'], 20)]
 
-    await assert.rejects(runScheduled('2026-10-06T12:11:00Z'), /citizen logins/)
+    await assert.rejects(runScheduled('2026-10-06T12:11:00Z'), /service: /)
     assert.deepEqual(storedState(), {
-      logs: '2026-10-06T12:00:00Z',
+      service: '2026-10-06T12:00:00Z',
       metrics: '2026-10-06T12:05:00Z'
     })
     assert.deepEqual(Object.keys(storedDay('5min/2026/10/06.json').series), [
@@ -493,10 +467,10 @@ describe('handler', () => {
     queueEmptyQueryResults(1)
     await assert.rejects(
       runScheduled('2026-10-06T12:16:00Z'),
-      /rds cpu: throttled/
+      /metrics: throttled/
     )
     assert.deepEqual(storedState(), {
-      logs: '2026-10-06T12:10:00Z',
+      service: '2026-10-06T12:10:00Z',
       metrics: '2026-10-06T12:05:00Z'
     })
     assert.deepEqual(logQueryRanges(), [
@@ -516,13 +490,11 @@ describe('handler', () => {
       '2026-10-07T00:21:00Z'
     ]
     for (const time of runs) {
-      queueEmptyQueryResults(2)
+      queueEmptyQueryResults(1)
       await runScheduled(time)
     }
 
     const ranges = logQueryRanges()
-    assert.equal(ranges[0][0], '2026-10-06T23:40:00Z')
-    assert.equal(ranges.at(-1)[1], '2026-10-07T00:15:00Z')
     for (let i = 1; i < ranges.length; i++) {
       assert.equal(ranges[i][0], ranges[i - 1][1])
     }
@@ -530,15 +502,14 @@ describe('handler', () => {
       ['2026-10-06T23:40:00Z', '2026-10-06T23:45:00Z'],
       ['2026-10-06T23:45:00Z', '2026-10-06T23:50:00Z'],
       ['2026-10-06T23:50:00Z', '2026-10-06T23:55:00Z'],
-      ['2026-10-06T23:55:00Z', '2026-10-07T00:00:00Z'],
-      ['2026-10-07T00:00:00Z', '2026-10-07T00:10:00Z'],
+      ['2026-10-06T23:55:00Z', '2026-10-07T00:10:00Z'],
       ['2026-10-07T00:10:00Z', '2026-10-07T00:15:00Z']
     ])
   })
 
   it('counts a log line at the boundary second only in the later run', async () => {
     setStoredState({
-      logs: '2026-10-06T12:00:00Z',
+      service: '2026-10-06T12:00:00Z',
       metrics: '2026-10-06T12:00:00Z'
     })
     // endTime is inclusive, so the first query also returns the line stamped
@@ -580,36 +551,32 @@ describe('handler', () => {
     )
   })
 
-  it('keeps the watermark at the end of the last stored day when a later day fails', async () => {
+  it('queries the same range again on the run after a failure', async () => {
     setStoredState({
-      logs: '2026-10-05T12:00:00Z',
+      service: '2026-10-05T12:00:00Z',
       metrics: '2026-10-06T12:00:00Z'
     })
-    cloudwatchLogsStub.queryResults = [
-      { status: 'Complete', results: [] },
-      { status: 'Failed' }
-    ]
+    cloudwatchLogsStub.queryResults = [{ status: 'Failed' }]
 
     await assert.rejects(
       runScheduled('2026-10-06T12:06:00Z'),
-      /2026-10-06T00:00:00Z\.\.2026-10-06T12:00:00Z: citizen logins/
+      /2026-10-05T12:00:00Z\.\.2026-10-06T00:00:00Z: service/
     )
-    assert.equal(storedState().logs, '2026-10-06T00:00:00Z')
-    assert.equal(storedDay('5min/2026/10/05.json').slots.length, 144)
+    assert.equal(storedState().service, '2026-10-05T12:00:00Z')
+    assert.equal(storedDay('5min/2026/10/05.json'), null)
 
     queueEmptyQueryResults(1)
     await runScheduled('2026-10-06T12:11:00Z')
     assert.deepEqual(logQueryRanges(), [
       ['2026-10-05T12:00:00Z', '2026-10-06T00:00:00Z'],
-      ['2026-10-06T00:00:00Z', '2026-10-06T12:00:00Z'],
-      ['2026-10-06T00:00:00Z', '2026-10-06T12:05:00Z']
+      ['2026-10-05T12:00:00Z', '2026-10-06T00:00:00Z']
     ])
-    assert.equal(storedState().logs, '2026-10-06T12:05:00Z')
+    assert.equal(storedState().service, '2026-10-06T00:00:00Z')
   })
 
   it('does not move a watermark back on a run for an earlier time', async () => {
     setStoredState({
-      logs: '2026-10-06T12:10:00Z',
+      service: '2026-10-06T12:10:00Z',
       metrics: '2026-10-06T12:10:00Z'
     })
 
@@ -620,19 +587,19 @@ describe('handler', () => {
       ['2026-10-06T11:30:00Z', '2026-10-06T12:00:00Z']
     ])
     assert.deepEqual(storedState(), {
-      logs: '2026-10-06T12:10:00Z',
+      service: '2026-10-06T12:10:00Z',
       metrics: '2026-10-06T12:10:00Z'
     })
   })
 
   for (const [name, body] of [
-    ['is not JSON', '{"logs": '],
+    ['is not JSON', '{"service": '],
     ['is not an object', '["2026-10-06T12:00:00Z"]'],
-    ['has a watermark that is not a time', '{"logs": "yesterday"}'],
+    ['has a watermark that is not a time', '{"service": "yesterday"}'],
     ['has a watermark that is not a string', '{"metrics": 1791288000000}'],
     [
       'has a watermark that is not at a bucket start',
-      '{"logs": "2026-10-06T12:02:00Z"}'
+      '{"service": "2026-10-06T12:02:00Z"}'
     ]
   ]) {
     it(`fails and queries nothing when the state file ${name}`, async () => {
@@ -648,14 +615,12 @@ describe('handler', () => {
     })
   }
 
-  it('backfills one query and one metric call for each UTC day', async () => {
-    cloudwatchLogsStub.queryResults = [
-      {
-        status: 'Complete',
-        results: [insightsRow('2026-10-01 08:00:00.000', 'CitizenWeakLogin', 2)]
-      },
-      { status: 'Complete', results: [] }
-    ]
+  it('backfills with one query and one metric call for each chunk', async () => {
+    queueEmptyQueryResults(3)
+    cloudwatchLogsStub.queryResults.unshift({
+      status: 'Complete',
+      results: [insightsRow('2026-10-01 08:00:00.000', 'CitizenWeakLogin', 2)]
+    })
     const result = await handler(
       {
         backfill: { from: '2026-10-01T00:00:00Z', to: '2026-10-03T00:00:00Z' }
@@ -663,19 +628,18 @@ describe('handler', () => {
       context()
     )
 
+    const chunks = [
+      ['2026-10-01T00:00:00Z', '2026-10-01T12:00:00Z'],
+      ['2026-10-01T12:00:00Z', '2026-10-02T00:00:00Z'],
+      ['2026-10-02T00:00:00Z', '2026-10-02T12:00:00Z'],
+      ['2026-10-02T12:00:00Z', '2026-10-03T00:00:00Z']
+    ]
     assert.deepEqual(result, {
-      processed: ['5min/2026/10/01.json', '5min/2026/10/02.json'],
+      processed: chunks.map(([from, to]) => `${from}..${to}`),
       next: null
     })
-    const starts = cloudwatchLogsStub.calls.filter((c) => c.input.queryString)
-    assert.deepEqual(
-      starts.map((c) => [c.input.startTime, c.input.endTime]),
-      [
-        [ms('2026-10-01T00:00:00Z') / 1000, ms('2026-10-02T00:00:00Z') / 1000],
-        [ms('2026-10-02T00:00:00Z') / 1000, ms('2026-10-03T00:00:00Z') / 1000]
-      ]
-    )
-    assert.equal(cloudwatchStub.calls.length, 2)
+    assert.deepEqual(logQueryRanges(), chunks)
+    assert.deepEqual(metricRanges(), chunks)
     const day = storedDay('5min/2026/10/01.json')
     assert.equal(day.slots.length, 288)
     assert.equal(day.slots[96][WEAK], 2)
@@ -683,12 +647,12 @@ describe('handler', () => {
 
   it('does not read or write the watermarks on a backfill', async () => {
     const state = {
-      logs: '2026-10-06T12:00:00Z',
+      service: '2026-10-06T12:00:00Z',
       metrics: '2026-10-06T12:00:00Z'
     }
     setStoredState(state)
     const stateObject = s3Stub.objects.get(STATE_KEY)
-    queueEmptyQueryResults(1)
+    queueEmptyQueryResults(2)
 
     await handler(
       {
@@ -705,7 +669,7 @@ describe('handler', () => {
     assert.ok(storedDay('5min/2026/10/01.json'))
   })
 
-  it('stops a backfill and names the next day when time runs out', async () => {
+  it('stops a backfill and names the next range when time runs out', async () => {
     cloudwatchLogsStub.queryResults = [{ status: 'Complete', results: [] }]
     const remaining = [300_000, 59_999]
     const result = await handler(
@@ -715,8 +679,8 @@ describe('handler', () => {
       context(() => remaining.shift())
     )
     assert.deepEqual(result, {
-      processed: ['5min/2026/10/01.json'],
-      next: { from: '2026-10-02T00:00:00Z', to: '2026-10-03T00:00:00Z' }
+      processed: ['2026-10-01T00:00:00Z..2026-10-01T12:00:00Z'],
+      next: { from: '2026-10-01T12:00:00Z', to: '2026-10-03T00:00:00Z' }
     })
     assert.equal(storedDay('5min/2026/10/02.json'), null)
   })

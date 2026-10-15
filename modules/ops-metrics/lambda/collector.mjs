@@ -1,47 +1,37 @@
-import { counterNames, seriesMeta } from './series.mjs'
+import { seriesMeta } from './series.mjs'
 import {
   BUCKET_MS,
   DAY_MS,
   STATE_KEY,
-  bucketStarts,
   ceilToBucket,
   dayKey,
   floorToBucket,
   isoTime,
   readState,
-  splitByUtcDay,
+  splitIntoChunks,
   toSlots,
   upsertDay,
   utcDayStart,
-  writeState,
-  zeroFill
+  writeState
 } from './store.mjs'
-import { parseBinTime, runInsightsQuery } from './insights.mjs'
+import { queryBuckets } from './insights.mjs'
 import { getMetricSummaries } from './metrics.mjs'
+import {
+  SERVICE_MAX_RANGE_MS,
+  SERVICE_QUERY,
+  SERVICE_SERIES,
+  serviceValuesFromRows
+} from './queries.mjs'
 
-// A run stops before a day when less than this is left of the Lambda timeout.
-// It must exceed the time to process one day, which is mostly the Insights
-// query deadline in insights.mjs.
+// A run stops before a source or a backfill chunk when less than this is left
+// of the Lambda timeout. It must exceed the time to process one chunk, which is
+// mostly the Insights query deadline in insights.mjs. A result that reaches the
+// row limit adds a query for each half, which this does not cover.
 const MIN_REMAINING_MS = 60_000
-
-export const MAX_CATCH_UP_MS = DAY_MS
 
 // CloudWatch can add a datapoint to a bucket some minutes after the bucket
 // closed, so a scheduled run reads the metrics again this far back.
 export const METRICS_LOOKBACK_MS = 6 * BUCKET_MS
-
-export const LOGIN_SERIES_BY_EVENT_CODE = {
-  CitizenLogin: 'citizen.login{auth=strong}',
-  CitizenWeakLogin: 'citizen.login{auth=weak}',
-  CitizenPasskeyLogin: 'citizen.login{auth=weak}'
-}
-
-const LOGIN_SERIES = [...new Set(Object.values(LOGIN_SERIES_BY_EVENT_CODE))]
-
-// The event codes in the filter must be the keys of LOGIN_SERIES_BY_EVENT_CODE.
-export const LOGIN_QUERY = `fields @timestamp
-| filter type = "app-audit-events" and eventCode in ["CitizenLogin", "CitizenWeakLogin", "CitizenPasskeyLogin"]
-| stats count() as n by bin(5m) as t, eventCode`
 
 function config() {
   return {
@@ -71,10 +61,10 @@ function parseWatermark(value) {
 
 // A watermarkMs of NaN means that there is no watermark. Then only the bucket
 // that ends at endMs is processed.
-export function scheduledRange(watermarkMs, endMs, lookbackMs) {
+export function scheduledRange(watermarkMs, endMs, lookbackMs, maxRangeMs) {
   const start = Number.isNaN(watermarkMs) ? endMs - BUCKET_MS : watermarkMs
   const fromMs = Math.min(start, endMs - lookbackMs)
-  return { fromMs, toMs: Math.min(endMs, fromMs + MAX_CATCH_UP_MS) }
+  return { fromMs, toMs: Math.min(endMs, fromMs + maxRangeMs) }
 }
 
 // Buckets that are not closed yet are left out: zero-fill would write zeros
@@ -89,24 +79,6 @@ export function backfillRange(backfill, nowMs, ingestionDelayMs) {
     fromMs: floorToBucket(from),
     toMs: Math.min(ceilToBucket(to), latestClosedEnd(nowMs, ingestionDelayMs))
   }
-}
-
-export function loginCountsFromRows(rows, fromMs, toMs) {
-  const counts = new Map()
-  for (const row of rows) {
-    const series = LOGIN_SERIES_BY_EVENT_CODE[row.eventCode]
-    if (!series) continue
-    const t = parseBinTime(row.t)
-    if (t < fromMs || t >= toMs) continue
-    const values = counts.get(t) ?? {}
-    values[series] = (values[series] ?? 0) + Number(row.n)
-    counts.set(t, values)
-  }
-  return zeroFill(
-    counts,
-    bucketStarts(fromMs, toMs),
-    counterNames(LOGIN_SERIES)
-  )
 }
 
 function rdsCpuMetric(rdsInstanceIdentifier) {
@@ -125,27 +97,29 @@ export function summariesToValues(summaries, seriesName, fromMs, toMs) {
   return values
 }
 
+// The name of a source is also its key in the state file. maxRangeMs is the
+// longest range of one query or GetMetricData call.
 function sources(cfg) {
   return [
     {
-      name: 'citizen logins',
-      stateKey: 'logs',
+      name: 'service',
       lookbackMs: 0,
-      series: LOGIN_SERIES,
+      maxRangeMs: SERVICE_MAX_RANGE_MS,
+      series: SERVICE_SERIES,
       async collect(fromMs, toMs) {
-        const rows = await runInsightsQuery(
+        const rows = await queryBuckets(
           [cfg.serviceLogGroupName],
-          LOGIN_QUERY,
+          SERVICE_QUERY,
           fromMs,
           toMs
         )
-        return loginCountsFromRows(rows, fromMs, toMs)
+        return serviceValuesFromRows(rows, fromMs, toMs)
       }
     },
     {
-      name: 'rds cpu',
-      stateKey: 'metrics',
+      name: 'metrics',
       lookbackMs: METRICS_LOOKBACK_MS,
+      maxRangeMs: DAY_MS,
       series: ['rds.cpu'],
       async collect(fromMs, toMs) {
         const summaries = await getMetricSummaries(
@@ -191,7 +165,11 @@ async function storeRange(cfg, rangeSources, fromMs, toMs) {
   const values = mergeValues(
     outcomes.filter((o) => o.status === 'fulfilled').map((o) => o.value)
   )
-  const series = seriesMeta(succeeded.flatMap((source) => source.series))
+  // A series with an open-ended label is only in the values.
+  const valueKeys = [...values.values()].flatMap((slot) => Object.keys(slot))
+  const series = seriesMeta([
+    ...new Set([...succeeded.flatMap((source) => source.series), ...valueKeys])
+  ])
 
   for (const [day, dayValues] of groupByDay(values)) {
     await upsertDay(cfg.bucket, dayKey(day), series, toSlots(dayValues))
@@ -211,7 +189,9 @@ function rangeText(fromMs, toMs) {
 }
 
 // The watermark of a source is the end of the last bucket that it stored.
-// A source that fails keeps its watermark, so the next run retries it.
+// Each run makes at most one query or call for each source, from its
+// watermark. A source that fails keeps its watermark, so the next run retries
+// it, and the other sources continue.
 async function runScheduled(cfg, nowMs, context) {
   const endMs = latestClosedEnd(nowMs, cfg.ingestionDelayMs)
   const state = await readState(cfg.bucket)
@@ -220,7 +200,7 @@ async function runScheduled(cfg, nowMs, context) {
 
   const scheduledSources = sources(cfg)
   const watermarks = scheduledSources.map((source) =>
-    parseWatermark(state[source.stateKey])
+    parseWatermark(state[source.name])
   )
 
   for (const [i, source] of scheduledSources.entries()) {
@@ -228,46 +208,34 @@ async function runScheduled(cfg, nowMs, context) {
     const { fromMs, toMs } = scheduledRange(
       watermarkMs,
       endMs,
-      source.lookbackMs
+      source.lookbackMs,
+      source.maxRangeMs
     )
-    for (const chunk of splitByUtcDay(fromMs, toMs)) {
-      if (context.getRemainingTimeInMillis() < MIN_REMAINING_MS) {
-        console.log(
-          `Stopped ${source.name} before ${isoTime(chunk.fromMs)}, the next run continues`
-        )
-        break
-      }
-      let chunkFailures
-      try {
-        chunkFailures = await storeRange(
-          cfg,
-          [source],
-          chunk.fromMs,
-          chunk.toMs
-        )
-      } catch (err) {
-        chunkFailures = [`${source.name}: ${err.message}`]
-      }
-      if (chunkFailures.length > 0) {
-        failures.push(
-          `Failed to collect ${rangeText(chunk.fromMs, chunk.toMs)}: ${chunkFailures.join('; ')}`
-        )
-        break
-      }
-      // The metrics lookback, or a retried run for an earlier time, can process
-      // chunks that end before the watermark.
-      if (Number.isNaN(watermarkMs) || chunk.toMs > watermarkMs) {
-        state[source.stateKey] = isoTime(chunk.toMs)
-        await writeState(cfg.bucket, state)
-      }
-      processed[source.stateKey] = {
-        from: processed[source.stateKey]?.from ?? isoTime(chunk.fromMs),
-        to: isoTime(chunk.toMs)
-      }
-      console.log(
-        `Processed ${source.name} ${rangeText(chunk.fromMs, chunk.toMs)}`
-      )
+    if (fromMs >= toMs) continue
+    if (context.getRemainingTimeInMillis() < MIN_REMAINING_MS) {
+      console.log(`Stopped before ${source.name}, the next run continues`)
+      break
     }
+    let sourceFailures
+    try {
+      sourceFailures = await storeRange(cfg, [source], fromMs, toMs)
+    } catch (err) {
+      sourceFailures = [`${source.name}: ${err.message}`]
+    }
+    if (sourceFailures.length > 0) {
+      failures.push(
+        `Failed to collect ${rangeText(fromMs, toMs)}: ${sourceFailures.join('; ')}`
+      )
+      continue
+    }
+    // The metrics lookback, or a retried run for an earlier time, can process
+    // a range that ends before the watermark.
+    if (Number.isNaN(watermarkMs) || toMs > watermarkMs) {
+      state[source.name] = isoTime(toMs)
+      await writeState(cfg.bucket, state)
+    }
+    processed[source.name] = { from: isoTime(fromMs), to: isoTime(toMs) }
+    console.log(`Processed ${source.name} ${rangeText(fromMs, toMs)}`)
   }
 
   if (failures.length > 0) throw new Error(failures.join('; '))
@@ -280,8 +248,12 @@ async function runBackfill(cfg, backfill, context) {
     Date.now(),
     cfg.ingestionDelayMs
   )
+  const backfillSources = sources(cfg)
+  const chunkMs = Math.min(
+    ...backfillSources.map((source) => source.maxRangeMs)
+  )
   const processed = []
-  for (const chunk of splitByUtcDay(fromMs, toMs)) {
+  for (const chunk of splitIntoChunks(fromMs, toMs, chunkMs)) {
     if (context.getRemainingTimeInMillis() < MIN_REMAINING_MS) {
       const next = { from: isoTime(chunk.fromMs), to: isoTime(toMs) }
       console.log(
@@ -291,17 +263,16 @@ async function runBackfill(cfg, backfill, context) {
     }
     const failures = await storeRange(
       cfg,
-      sources(cfg),
+      backfillSources,
       chunk.fromMs,
       chunk.toMs
     )
+    const range = rangeText(chunk.fromMs, chunk.toMs)
     if (failures.length > 0) {
-      throw new Error(
-        `Failed to collect ${rangeText(chunk.fromMs, chunk.toMs)}: ${failures.join('; ')}`
-      )
+      throw new Error(`Failed to collect ${range}: ${failures.join('; ')}`)
     }
-    console.log(`Backfilled ${rangeText(chunk.fromMs, chunk.toMs)}`)
-    processed.push(dayKey(chunk.fromMs))
+    console.log(`Backfilled ${range}`)
+    processed.push(range)
   }
   return { processed, next: null }
 }

@@ -13,10 +13,10 @@ page presigned URLs to the files.
   deletes the 5-minute files after `raw_retention_days`.
 - A collector Lambda (`<name_prefix>-ops-metrics-collector`, Node.js 24, ARM64)
   and an EventBridge schedule (`collector_schedule`, by default
-  `cron(1/5 * * * ? *)`). It reads the citizen login audit events from
-  `service_log_group_name` with one Logs Insights query, and the RDS
-  `CPUUtilization` of `rds_instance_identifier` with one `GetMetricData` call,
-  and writes them to the day file. Its reserved concurrency is 1, so two runs
+  `cron(1/5 * * * ? *)`). It counts the lines of `service_log_group_name` with
+  one Logs Insights query, reads the RDS `CPUUtilization` of
+  `rds_instance_identifier` with one `GetMetricData` call, and writes them to
+  the day file. Its reserved concurrency is 1, so two runs
   cannot write the same file at the same time. It keeps its progress in
   `state/collector.json` in the same bucket.
 - A read Lambda (`<name_prefix>-ops-metrics-reader`) with a public Function URL.
@@ -38,14 +38,24 @@ file, use `aws s3 cp s3://<bucket>/5min/2026/10/06.json - | gunzip | jq`.
 {
   "series": {
     "citizen.login{auth=strong}": { "type": "counter" },
-    "citizen.login{auth=weak}": { "type": "counter" },
+    "service.asyncJob.failed": { "type": "counter" },
+    "service.asyncJob.failed{type=SendMessage}": { "type": "counter" },
+    "service.responseTime": {
+      "type": "histogram",
+      "bounds": [
+        2.15, 4.64, 10, 21.54, 46.42, 100, 215.44, 464.16, 1000, 2154.43,
+        4641.59, 10000
+      ]
+    },
     "rds.cpu": { "type": "gaugeSummary" }
   },
   "slots": [
     {
       "t": "2026-10-06T00:00:00Z",
       "citizen.login{auth=strong}": 12,
-      "citizen.login{auth=weak}": 3,
+      "service.asyncJob.failed": 2,
+      "service.asyncJob.failed{type=SendMessage}": 2,
+      "service.responseTime": [0, 0, 41, 120, 88, 30, 9, 3, 1, 0, 0, 0, 0],
       "rds.cpu": { "min": 8, "mean": 12.5, "max": 31, "n": 5 }
     }
   ]
@@ -53,14 +63,42 @@ file, use `aws s3 cp s3://<bucket>/5min/2026/10/06.json - | gunzip | jq`.
 ```
 
 - `t` is the start of the bucket. Slots are sorted by `t`.
+- Labels are part of the series name: `name{k=v}` or `name{k1=v1,k2=v2}`.
+- A `counter` is the number of events in the bucket.
+- A `histogram` is an array of 13 counts of response times in milliseconds.
+  Count `i` holds the values `v` with `bounds[i-1] <= v < bounds[i]`: count 0
+  is `v < bounds[0]` and count 12 is `v >= bounds[11]`. There are three bounds
+  for each decade.
+- A `gaugeSummary` is the minimum, average, maximum and sample count of a
+  metric in the bucket.
 - A missing slot or key means that the value is not known: the collector has
-  not processed the bucket, or it failed. A counter is 0 when the collector
-  processed the bucket and there were no events.
-- `citizen.login{auth=strong}` counts `CitizenLogin` audit events, and
-  `citizen.login{auth=weak}` counts `CitizenWeakLogin` and
-  `CitizenPasskeyLogin`.
-- `rds.cpu` is the minimum, average, maximum and sample count of
-  `CPUUtilization` in the bucket. A bucket with no datapoint has no `rds.cpu`.
+  not processed the bucket, or it failed. A counter is 0, and a histogram is
+  all zeros, when the collector processed the bucket and there were no events.
+- A series with a job type label is not zero-filled. A missing key means 0
+  when the slot has the series of the same name without the label.
+
+| Series                                                                        | Type         | From                                                                                                                                     |
+| ----------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `citizen.login{auth=strong}`                                                  | counter      | Audit `CitizenLogin`                                                                                                                     |
+| `citizen.login{auth=weak}`                                                    | counter      | Audit `CitizenWeakLogin`, `CitizenPasskeyLogin`                                                                                          |
+| `citizen.loginAttempt{auth=weak}`                                             | counter      | Audit `CitizenWeakLoginAttempt`, `CitizenPasskeyLoginAttempt`                                                                            |
+| `employee.login{method=ad\|sfi\|pin}`                                         | counter      | Audit `EmployeeLogin`, `EmployeeSfiLogin`, and `PinLogin` with `meta.status = "SUCCESS"`                                                 |
+| `message.sent{by=employee\|citizen\|reply}`                                   | counter      | Audit `MessagingNewMessageWrite`, `MessagingCitizenSendMessage`, `MessagingReplyToThreadWrite`                                           |
+| `passkey.registered`                                                          | counter      | Audit `CitizenPasskeyRegister`                                                                                                           |
+| `push.subscribed{app=citizen\|employee}`                                      | counter      | Audit `CitizenPushSubscriptionCreate`, `PushSubscriptionUpsert`                                                                          |
+| `service.requests{class=2xx\|3xx\|4xx\|5xx}`                                  | counter      | Access log lines (`type = "app-requests-received"`) by `statusCode`                                                                      |
+| `service.responseTime`                                                        | histogram    | Same lines, `responseTime`                                                                                                               |
+| `service.errors`                                                              | counter      | `logLevel = "ERROR"` in `app-misc` lines                                                                                                 |
+| `service.asyncJob.failed`, `service.asyncJob.failed{type=<job type>}`         | counter      | WARN "Failed to run async job", by `meta.jobType`                                                                                        |
+| `service.asyncJob.permanentlyFailed`, `...permanentlyFailed{type=<job type>}` | counter      | ERROR "Async job ... permanently failed (remainingAttempts=0)", by `meta.jobType`                                                        |
+| `integration.failed{system=email\|webpush\|varda\|dvv}`                       | counter      | ERROR "Couldn't send email", "Web push failed", "Varda update failed", "Failed to update unit", "... DVV modification(s) service failed" |
+| `vtj.requests{result=ok\|error}`                                              | counter      | `type = "vtj-audit-events"`: `status` "response received", or "error during request" and "response parsing failure"                      |
+| `sanityCheck.failed`                                                          | counter      | ERROR "Sanity check failed"                                                                                                              |
+| `rds.cpu`                                                                     | gaugeSummary | `CPUUtilization` of the database. A bucket with no datapoint has no `rds.cpu`.                                                           |
+
+`integration.failed{system=varda}` counts each failed Varda child or unit
+update once. The Varda client line "request failed" that comes before it does
+not count.
 
 ## Collector
 
@@ -73,9 +111,11 @@ The collector keeps a watermark for each source in `state/collector.json`: the
 end of the last bucket that it stored.
 
 ```json
-{ "logs": "2026-10-06T12:00:00Z", "metrics": "2026-10-06T12:00:00Z" }
+{ "service": "2026-10-06T12:00:00Z", "metrics": "2026-10-06T12:00:00Z" }
 ```
 
+- Each run makes at most one Logs Insights query or `GetMetricData` call for
+  each source.
 - Logs: each run queries Logs Insights from the watermark to the latest closed
   bucket, so each log line is scanned only once. When no bucket closed since
   the last run, there is no query. The first run, with no watermark, processes
@@ -84,12 +124,16 @@ end of the last bucket that it stored.
   closed bucket again, because CloudWatch can add a datapoint some minutes
   late. `GetMetricData` is cheap.
 - A source writes its watermark only after its slots are stored. A source that
-  fails keeps its watermark, so the next run retries it, and the other source
-  continues.
-- After an outage, the next runs fill the missed buckets automatically: up to
-  1 day for each run, with one query for each UTC day. A run also stops before
-  a day when less than 60 s of the 300 s timeout is left. Later runs continue
-  from the watermark.
+  fails keeps its watermark, so the next run retries it, and the other sources
+  continue.
+- After an outage, the next runs fill the missed buckets automatically: each
+  run covers up to 12 hours of the service log group and 1 day of metrics. The
+  12 hours keep a query result under 10,000 rows, the most that one
+  `GetQueryResults` call returns. A result that reaches 10,000 rows is queried
+  again in two halves, down to one bucket; a bucket that still reaches it fails
+  the source, and nothing is stored for the range. A run stops before a source
+  when less than 60 s of the 300 s timeout is left. Later runs continue from the
+  watermark.
 
 Writing a slot again gives the same result. A scheduled run fails without a
 query when `state/collector.json` is not a JSON object, or has a watermark that
@@ -100,8 +144,9 @@ delete `state/collector.json`.
 
 Backfill is only for the history before the first scheduled run; the
 scheduled runs fill their own gaps. A backfill does not read or move the
-watermarks. Invoke the collector with a range. It runs one Insights query and one
-`GetMetricData` call for each UTC day, and stops at the last closed bucket.
+watermarks. Invoke the collector with a range. It splits the range into chunks
+of 12 hours, runs one Insights query and one `GetMetricData` call for each
+chunk, and stops at the last closed bucket.
 
 ```sh
 aws lambda invoke --function-name <name_prefix>-ops-metrics-collector \
@@ -114,8 +159,9 @@ aws lambda invoke --function-name <name_prefix>-ops-metrics-collector \
 The AWS CLI waits 60 s for a response by default and then sends the
 invocation again, so keep `--cli-read-timeout` above the 300 s timeout.
 
-When less than 60 s of the 300 s timeout is left, the collector stops before
-the next day and returns `next`, the range to invoke again with. The reserved
+The response lists the `processed` chunks. When less than 60 s of the 300 s
+timeout is left, the collector stops before the next chunk and returns `next`,
+the range to invoke again with. The reserved
 concurrency is 1, so an invocation can be throttled while a scheduled run is
 in progress; invoke again.
 

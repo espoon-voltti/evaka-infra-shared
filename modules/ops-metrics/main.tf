@@ -162,6 +162,7 @@ data "archive_file" "ops_metrics" {
     "collector.test.mjs",
     "insights.test.mjs",
     "metrics.test.mjs",
+    "queries.test.mjs",
     "reader.test.mjs",
     "store.test.mjs",
     "mock-aws-loader.mjs",

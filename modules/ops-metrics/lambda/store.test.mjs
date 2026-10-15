@@ -4,6 +4,7 @@ import { gunzipSync } from 'node:zlib'
 
 import { s3Stub } from './stub-s3.mjs'
 import {
+  DAY_MS,
   STATE_KEY,
   bucketStarts,
   dayKey,
@@ -12,7 +13,7 @@ import {
   encodeDay,
   readDay,
   readState,
-  splitByUtcDay,
+  splitIntoChunks,
   toSlots,
   upsertDay,
   upsertSlots,
@@ -55,10 +56,10 @@ describe('dayKeysForRange', () => {
   })
 })
 
-describe('splitByUtcDay', () => {
-  it('splits a range at UTC midnights', () => {
+describe('splitIntoChunks', () => {
+  it('splits a range at UTC midnights with day chunks', () => {
     assert.deepEqual(
-      splitByUtcDay(ms('2026-10-05T22:00Z'), ms('2026-10-07T01:00Z')),
+      splitIntoChunks(ms('2026-10-05T22:00Z'), ms('2026-10-07T01:00Z'), DAY_MS),
       [
         { fromMs: ms('2026-10-05T22:00Z'), toMs: ms('2026-10-06T00:00Z') },
         { fromMs: ms('2026-10-06T00:00Z'), toMs: ms('2026-10-07T00:00Z') },
@@ -67,9 +68,24 @@ describe('splitByUtcDay', () => {
     )
   })
 
+  it('ends chunks at multiples of the chunk length', () => {
+    assert.deepEqual(
+      splitIntoChunks(
+        ms('2026-10-05T03:00Z'),
+        ms('2026-10-06T06:00Z'),
+        DAY_MS / 2
+      ),
+      [
+        { fromMs: ms('2026-10-05T03:00Z'), toMs: ms('2026-10-05T12:00Z') },
+        { fromMs: ms('2026-10-05T12:00Z'), toMs: ms('2026-10-06T00:00Z') },
+        { fromMs: ms('2026-10-06T00:00Z'), toMs: ms('2026-10-06T06:00Z') }
+      ]
+    )
+  })
+
   it('gives nothing for an empty range', () => {
     assert.deepEqual(
-      splitByUtcDay(ms('2026-10-05T00:00Z'), ms('2026-10-05T00:00Z')),
+      splitIntoChunks(ms('2026-10-05T00:00Z'), ms('2026-10-05T00:00Z'), DAY_MS),
       []
     )
   })
@@ -96,14 +112,16 @@ describe('bucketStarts', () => {
 })
 
 describe('zeroFill', () => {
+  const counter = { type: 'counter' }
+  const histogram = { type: 'histogram', bounds: [10, 100] }
+
   it('adds a zero for each missing counter in each bucket of the range', () => {
     const t0 = ms('2026-10-05T00:00Z')
     const t1 = ms('2026-10-05T00:05Z')
-    const filled = zeroFill(
-      new Map([[t0, { a: 3, other: 1 }]]),
-      [t0, t1],
-      ['a', 'b']
-    )
+    const filled = zeroFill(new Map([[t0, { a: 3, other: 1 }]]), [t0, t1], {
+      a: counter,
+      b: counter
+    })
     assert.deepEqual(
       [...filled],
       [
@@ -113,15 +131,43 @@ describe('zeroFill', () => {
     )
   })
 
+  it('adds all-zero counts for a missing histogram and keeps a stored one', () => {
+    const t0 = ms('2026-10-05T00:00Z')
+    const t1 = ms('2026-10-05T00:05Z')
+    const filled = zeroFill(new Map([[t0, { h: [1, 0, 2] }]]), [t0, t1], {
+      h: histogram
+    })
+    assert.deepEqual(filled.get(t0), { h: [1, 0, 2] })
+    assert.deepEqual(filled.get(t1), { h: [0, 0, 0] })
+  })
+
+  it('gives each bucket its own histogram array', () => {
+    const t0 = ms('2026-10-05T00:00Z')
+    const t1 = ms('2026-10-05T00:05Z')
+    const filled = zeroFill(new Map(), [t0, t1], { h: histogram })
+    filled.get(t0).h[0] = 5
+    assert.deepEqual(filled.get(t1).h, [0, 0, 0])
+  })
+
   it('does not add buckets outside the range', () => {
     const outside = ms('2026-10-04T23:55Z')
     const filled = zeroFill(
       new Map([[outside, { x: { min: 1 } }]]),
       [ms('2026-10-05T00:00Z')],
-      ['a']
+      { a: counter }
     )
     // The bucket outside the range keeps its values and gets no counter keys.
     assert.deepEqual(filled.get(outside), { x: { min: 1 } })
+  })
+
+  it('throws for a series that has no zero value', () => {
+    assert.throws(
+      () =>
+        zeroFill(new Map(), [ms('2026-10-05T00:00Z')], {
+          'rds.cpu': { type: 'gaugeSummary' }
+        }),
+      /gaugeSummary/
+    )
   })
 })
 
@@ -170,6 +216,23 @@ describe('upsertSlots', () => {
       t: '2026-10-05T00:10:00Z',
       a: 7,
       b: { min: 1, mean: 2, max: 3, n: 5 }
+    })
+  })
+
+  it('replaces a histogram of a slot as one value and keeps its bounds', () => {
+    const histogram = { type: 'histogram', bounds: [10, 100] }
+    const stored = upsertSlots(day, { h: histogram }, [
+      { t: '2026-10-05T00:10:00Z', h: [1, 2, 3] }
+    ])
+    const result = upsertSlots(stored, { h: histogram }, [
+      { t: '2026-10-05T00:10:00Z', h: [0, 4, 0] }
+    ])
+    assert.deepEqual(result.series.h, histogram)
+    assert.deepEqual(result.slots[1], {
+      t: '2026-10-05T00:10:00Z',
+      a: 5,
+      b: { min: 1, mean: 2, max: 3, n: 5 },
+      h: [0, 4, 0]
     })
   })
 
@@ -263,7 +326,7 @@ describe('readState and writeState', () => {
   })
 
   it('writes plain JSON and reads it back', async () => {
-    const state = { logs: '2026-10-06T12:00:00Z' }
+    const state = { service: '2026-10-06T12:00:00Z' }
     await writeState('bucket', state)
     const object = s3Stub.objects.get(STATE_KEY)
     assert.equal(object.ContentType, 'application/json')

@@ -4,8 +4,11 @@ import {
   GetQueryResultsCommand
 } from '@aws-sdk/client-cloudwatch-logs'
 
-// A backfill starts a day only with MIN_REMAINING_MS of the Lambda timeout
-// left (collector.mjs), so a query deadline must stay well under it.
+import { floorToBucket, isoTime } from './store.mjs'
+
+// A run starts a source or a backfill chunk only with MIN_REMAINING_MS of the
+// Lambda timeout left (collector.mjs), so a query deadline must stay well
+// under it.
 const QUERY_DEADLINE_MS = 45_000
 
 // Delays (ms) before successive GetQueryResults polls: quick at first, since
@@ -13,9 +16,9 @@ const QUERY_DEADLINE_MS = 45_000
 const POLL_BACKOFF_MS = [0, 100, 200, 400, 800, 1200, 1500, 1800]
 const POLL_INTERVAL_MS = 2000
 
-// A stats query over one day by bin(5m) and a few labels gives about 1000 rows,
-// which is the default limit.
-const RESULT_LIMIT = 10_000
+// The most rows that one GetQueryResults call returns. A result with this many
+// rows can be truncated.
+export const RESULT_LIMIT = 10_000
 
 const logsClient = new CloudWatchLogsClient({})
 
@@ -60,6 +63,55 @@ export async function runInsightsQuery(
   throw new Error(
     `Insights query ${queryId} did not complete: status ${lastStatus} after ${attempts} polls`
   )
+}
+
+// Gives the rows of a stats query `by bin(5m) as t` whose bucket starts in
+// [fromMs, toMs). endTime is inclusive, so the query also returns the bucket
+// that starts at toMs, with only the lines of its first second.
+export async function queryBuckets(
+  logGroupNames,
+  queryString,
+  fromMs,
+  toMs,
+  options
+) {
+  const rows = await runInsightsQuery(
+    logGroupNames,
+    queryString,
+    fromMs,
+    toMs,
+    options
+  )
+  if (rows.length < RESULT_LIMIT) {
+    return rows.filter((row) => {
+      const t = parseBinTime(row.t)
+      return t >= fromMs && t < toMs
+    })
+  }
+  const midMs = floorToBucket((fromMs + toMs) / 2)
+  if (midMs <= fromMs) {
+    throw new Error(
+      `Insights query gave ${rows.length} rows for the bucket at ${isoTime(fromMs)}`
+    )
+  }
+  console.log(
+    `Insights query gave ${rows.length} rows for ${isoTime(fromMs)}..${isoTime(toMs)}, querying each half again`
+  )
+  const first = await queryBuckets(
+    logGroupNames,
+    queryString,
+    fromMs,
+    midMs,
+    options
+  )
+  const second = await queryBuckets(
+    logGroupNames,
+    queryString,
+    midMs,
+    toMs,
+    options
+  )
+  return [...first, ...second]
 }
 
 export function rowToObject(row) {
