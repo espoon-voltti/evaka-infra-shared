@@ -284,20 +284,40 @@ async function runScheduled(cfg, nowMs, context) {
   return processed
 }
 
+// Gives the sources named in `names`, or all of them without names.
+export function selectSources(available, names) {
+  if (names === undefined) return available
+  const known = available.map((source) => source.name)
+  if (
+    !Array.isArray(names) ||
+    names.length === 0 ||
+    names.some((name) => !known.includes(name))
+  ) {
+    throw new Error(
+      `Invalid backfill sources ${JSON.stringify(names)}, the configured sources are ${known.join(', ')}`
+    )
+  }
+  return available.filter((source) => names.includes(source.name))
+}
+
 async function runBackfill(cfg, backfill, context) {
   const { fromMs, toMs } = backfillRange(
     backfill,
     Date.now(),
     cfg.ingestionDelayMs
   )
-  const backfillSources = sources(cfg)
+  const backfillSources = selectSources(sources(cfg), backfill.sources)
   const chunkMs = Math.min(
     ...backfillSources.map((source) => source.maxRangeMs)
   )
   const processed = []
   for (const chunk of splitIntoChunks(fromMs, toMs, chunkMs)) {
     if (context.getRemainingTimeInMillis() < MIN_REMAINING_MS) {
-      const next = { from: isoTime(chunk.fromMs), to: isoTime(toMs) }
+      const next = {
+        from: isoTime(chunk.fromMs),
+        to: isoTime(toMs),
+        ...(backfill.sources && { sources: backfill.sources })
+      }
       console.log(
         `Backfill stopped before ${next.from}, invoke again with ${JSON.stringify({ backfill: next })}`
       )

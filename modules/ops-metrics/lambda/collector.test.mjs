@@ -19,6 +19,7 @@ const {
   mergeValues,
   latestClosedEnd,
   scheduledRange,
+  selectSources,
   summariesToValues
 } = await import('./collector.mjs')
 const { DAY_MS } = await import('./store.mjs')
@@ -217,6 +218,34 @@ describe('mergeValues and groupByDay', () => {
       b: 3
     })
   })
+})
+
+describe('selectSources', () => {
+  const available = [
+    { name: 'service' },
+    { name: 'apigw' },
+    { name: 'metrics' }
+  ]
+
+  it('gives all sources without names', () => {
+    assert.equal(selectSources(available, undefined), available)
+  })
+
+  it('gives the named sources in their usual order', () => {
+    assert.deepEqual(selectSources(available, ['metrics', 'apigw']), [
+      { name: 'apigw' },
+      { name: 'metrics' }
+    ])
+  })
+
+  for (const names of [['proxy'], [], 'apigw']) {
+    it(`throws for ${JSON.stringify(names)}`, () => {
+      assert.throws(
+        () => selectSources(available, names),
+        /configured sources are service, apigw, metrics/
+      )
+    })
+  }
 })
 
 describe('handler', () => {
@@ -805,5 +834,92 @@ describe('handler with the apigw and proxy log groups', () => {
       Object.keys(day.slots[0]).some((name) => name.startsWith('apigw.')),
       false
     )
+  })
+
+  it('backfills only the given sources and leaves the watermarks', async () => {
+    const state = { service: '2026-10-06T12:00:00Z' }
+    setStoredState(state)
+    const stateObject = s3Stub.objects.get(STATE_KEY)
+    queueEmptyQueryResults(4)
+
+    const result = await handler(
+      {
+        backfill: {
+          from: '2026-10-01T00:00:00Z',
+          to: '2026-10-02T00:00:00Z',
+          sources: ['apigw', 'proxy']
+        }
+      },
+      context()
+    )
+
+    assert.deepEqual(result.processed, [
+      '2026-10-01T00:00:00Z..2026-10-01T12:00:00Z',
+      '2026-10-01T12:00:00Z..2026-10-02T00:00:00Z'
+    ])
+    assert.deepEqual(
+      startedQueries()
+        .map(([groups]) => groups[0])
+        .sort(),
+      [
+        'evaka-apigw-staging',
+        'evaka-apigw-staging',
+        'evaka-proxy-staging',
+        'evaka-proxy-staging'
+      ]
+    )
+    assert.equal(cloudwatchStub.calls.length, 0)
+    assert.equal(s3Stub.objects.get(STATE_KEY), stateObject)
+    assert.equal(
+      s3Stub.calls.some((c) => c.input.Key === STATE_KEY),
+      false
+    )
+    const day = storedDay('5min/2026/10/01.json')
+    assert.equal(day.slots.length, 288)
+    assert.ok('apigw.responseTime{app=citizen}' in day.series)
+    assert.ok('proxy.status502' in day.series)
+    assert.equal('service.errors' in day.series, false)
+  })
+
+  it('names the sources in the next range of a stopped backfill', async () => {
+    queueEmptyQueryResults(1)
+    const remaining = [300_000, 59_999]
+    const result = await handler(
+      {
+        backfill: {
+          from: '2026-10-01T00:00:00Z',
+          to: '2026-10-03T00:00:00Z',
+          sources: ['proxy']
+        }
+      },
+      context(() => remaining.shift())
+    )
+    assert.deepEqual(result, {
+      processed: ['2026-10-01T00:00:00Z..2026-10-02T00:00:00Z'],
+      next: {
+        from: '2026-10-02T00:00:00Z',
+        to: '2026-10-03T00:00:00Z',
+        sources: ['proxy']
+      }
+    })
+  })
+
+  it('fails a backfill of a source that is not configured before any query', async () => {
+    delete process.env.PROXY_LOG_GROUP_NAME
+    await assert.rejects(
+      handler(
+        {
+          backfill: {
+            from: '2026-10-01T00:00:00Z',
+            to: '2026-10-02T00:00:00Z',
+            sources: ['proxy']
+          }
+        },
+        context()
+      ),
+      /Invalid backfill sources \["proxy"\]/
+    )
+    assert.deepEqual(cloudwatchLogsStub.calls, [])
+    assert.deepEqual(s3Stub.calls, [])
   })
 })

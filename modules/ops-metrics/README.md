@@ -172,8 +172,9 @@ delete `state/collector.json`.
 Backfill is only for the history before the first scheduled run; the
 scheduled runs fill their own gaps. A backfill does not read or move the
 watermarks. Invoke the collector with a range. It splits the range into chunks
-of 12 hours, runs one Insights query and one `GetMetricData` call for each
-chunk, and stops at the last closed bucket.
+of the shortest range of its sources (12 hours with the service or API gateway
+log group, otherwise 1 day), runs one Insights query for each log group and one
+`GetMetricData` call for each chunk, and stops at the last closed bucket.
 
 ```sh
 aws lambda invoke --function-name <name_prefix>-ops-metrics-collector \
@@ -186,11 +187,25 @@ aws lambda invoke --function-name <name_prefix>-ops-metrics-collector \
 The AWS CLI waits 60 s for a response by default and then sends the
 invocation again, so keep `--cli-read-timeout` above the 300 s timeout.
 
+To fill only some sources, for example the history of log groups that were
+added later, name them in `sources`. A name that is not a configured source
+fails the invocation before any query.
+
+```json
+{
+  "backfill": {
+    "from": "2026-10-01T00:00:00Z",
+    "to": "2026-10-15T00:00:00Z",
+    "sources": ["apigw", "proxy"]
+  }
+}
+```
+
 The response lists the `processed` chunks. When less than 60 s of the 300 s
 timeout is left, the collector stops before the next chunk and returns `next`,
-the range to invoke again with. The reserved
-concurrency is 1, so an invocation can be throttled while a scheduled run is
-in progress; invoke again.
+the backfill to invoke again with. The reserved concurrency is 1, so an
+invocation can be throttled while a scheduled run is in progress; invoke
+again.
 
 ## Read API
 
