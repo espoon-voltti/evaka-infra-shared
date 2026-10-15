@@ -47,7 +47,13 @@ variable "raw_retention_days" {
 }
 
 variable "collector_schedule" {
-  description = "EventBridge schedule of the collector. The collector processes closed 5-minute buckets, so the schedule must run every 5 minutes, a few minutes after each bucket closes."
+  description = "EventBridge schedule of the collector. The collector processes the 5-minute buckets that closed at least ingestion_delay_seconds ago, so the schedule must run every 5 minutes, just after that delay."
   type        = string
-  default     = "cron(3/5 * * * ? *)"
+  default     = "cron(1/5 * * * ? *)"
+}
+
+variable "ingestion_delay_seconds" {
+  description = "Time to wait after a 5-minute bucket closes before the collector reads it, because log ingestion is not immediate."
+  type        = number
+  default     = 300
 }

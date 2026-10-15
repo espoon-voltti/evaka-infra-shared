@@ -25,7 +25,11 @@ export class S3Client {
       const object = s3Stub.objects.get(command.input.Key)
       if (!object) throw new NoSuchKey('The specified key does not exist.')
       return {
-        Body: { transformToByteArray: async () => new Uint8Array(object.Body) }
+        Body: {
+          transformToByteArray: async () => new Uint8Array(object.Body),
+          transformToString: async () =>
+            Buffer.from(object.Body).toString('utf8')
+        }
       }
     }
 

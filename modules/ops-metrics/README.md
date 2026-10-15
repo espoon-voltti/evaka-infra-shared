@@ -13,11 +13,12 @@ page presigned URLs to the files.
   deletes the 5-minute files after `raw_retention_days`.
 - A collector Lambda (`<name_prefix>-ops-metrics-collector`, Node.js 24, ARM64)
   and an EventBridge schedule (`collector_schedule`, by default
-  `cron(3/5 * * * ? *)`). It reads the citizen login audit events from
+  `cron(1/5 * * * ? *)`). It reads the citizen login audit events from
   `service_log_group_name` with one Logs Insights query, and the RDS
   `CPUUtilization` of `rds_instance_identifier` with one `GetMetricData` call,
   and writes them to the day file. Its reserved concurrency is 1, so two runs
-  cannot write the same file at the same time.
+  cannot write the same file at the same time. It keeps its progress in
+  `state/collector.json` in the same bucket.
 - A read Lambda (`<name_prefix>-ops-metrics-reader`) with a public Function URL.
   It checks the bearer token against the SSM parameter `token_ssm_name` and
   returns presigned URLs to the day files of the requested range.
@@ -63,14 +64,43 @@ file, use `aws s3 cp s3://<bucket>/5min/2026/10/06.json - | gunzip | jq`.
 
 ## Collector
 
-Each scheduled run processes the last 6 closed buckets (30 minutes), whose end
-is at least 3 minutes ago because log ingestion is not immediate. It writes
-each of them again, so a missed run or a late log line is fixed by the next
-runs. Writing a slot again gives the same result.
+A bucket is closed when its end is at least `ingestion_delay_seconds` (by
+default 5 minutes) ago, because log ingestion is not immediate. With the
+default schedule, the run at minute 6 processes the bucket that ended at
+minute 0.
+
+The collector keeps a watermark for each source in `state/collector.json`: the
+end of the last bucket that it stored.
+
+```json
+{ "logs": "2026-10-06T12:00:00Z", "metrics": "2026-10-06T12:00:00Z" }
+```
+
+- Logs: each run queries Logs Insights from the watermark to the latest closed
+  bucket, so each log line is scanned only once. When no bucket closed since
+  the last run, there is no query. The first run, with no watermark, processes
+  only the latest closed bucket.
+- Metrics: each run also reads the 6 buckets (30 minutes) before the latest
+  closed bucket again, because CloudWatch can add a datapoint some minutes
+  late. `GetMetricData` is cheap.
+- A source writes its watermark only after its slots are stored. A source that
+  fails keeps its watermark, so the next run retries it, and the other source
+  continues.
+- After an outage, the next runs fill the missed buckets automatically: up to
+  1 day for each run, with one query for each UTC day. A run also stops before
+  a day when less than 60 s of the 300 s timeout is left. Later runs continue
+  from the watermark.
+
+Writing a slot again gives the same result. A scheduled run fails without a
+query when `state/collector.json` is not a JSON object, or has a watermark that
+is not the start of a bucket. To start again from the latest closed bucket,
+delete `state/collector.json`.
 
 ### Backfill
 
-Invoke the collector with a range. It runs one Insights query and one
+Backfill is only for the history before the first scheduled run; the
+scheduled runs fill their own gaps. A backfill does not read or move the
+watermarks. Invoke the collector with a range. It runs one Insights query and one
 `GetMetricData` call for each UTC day, and stops at the last closed bucket.
 
 ```sh
@@ -181,7 +211,8 @@ response has one URL, for 2026-10-05. Without the header, the response is 401.
 | `allowed_origins`         | `list(string)` | yes      |                         | Origins of the tracker page, for the CORS config of the Function URL and the bucket.          |
 | `bucket_kms_arn`          | `string`       | no       | `null`                  | Customer-managed KMS key of the bucket. Null uses SSE-S3.                                     |
 | `raw_retention_days`      | `number`       | no       | `400`                   | Days to keep the 5-minute files.                                                              |
-| `collector_schedule`      | `string`       | no       | `"cron(3/5 * * * ? *)"` | Schedule of the collector. It must run every 5 minutes.                                       |
+| `collector_schedule`      | `string`       | no       | `"cron(1/5 * * * ? *)"` | Schedule of the collector. It must run every 5 minutes.                                       |
+| `ingestion_delay_seconds` | `number`       | no       | `300`                   | Time after a bucket closes before the collector reads it.                                     |
 
 ## Outputs
 

@@ -8,6 +8,8 @@ import {
 export const BUCKET_MS = 5 * 60 * 1000
 export const DAY_MS = 24 * 60 * 60 * 1000
 
+export const STATE_KEY = 'state/collector.json'
+
 const s3 = new S3Client({})
 
 export function floorToBucket(ms) {
@@ -103,9 +105,14 @@ export function decodeDay(bytes) {
   return JSON.parse(gunzipSync(bytes).toString('utf8'))
 }
 
+// A missing object is a 404 only because the collector role has
+// s3:ListBucket; without it S3 answers 403.
+function isNotFound(err) {
+  return err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404
+}
+
 // The SDK does not decode Content-Encoding: gzip, so the body is the
-// compressed bytes. A missing object is a 404 only because the collector role
-// has s3:ListBucket; without it S3 answers 403.
+// compressed bytes.
 export async function readDay(bucket, key) {
   try {
     const response = await s3.send(
@@ -113,9 +120,7 @@ export async function readDay(bucket, key) {
     )
     return decodeDay(await response.Body.transformToByteArray())
   } catch (err) {
-    if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) {
-      return emptyDay()
-    }
+    if (isNotFound(err)) return emptyDay()
     throw err
   }
 }
@@ -138,4 +143,40 @@ async function writeDay(bucket, key, day) {
 export async function upsertDay(bucket, key, series, slots) {
   const day = await readDay(bucket, key)
   await writeDay(bucket, key, upsertSlots(day, series, slots))
+}
+
+// A state file that cannot be read fails the run: starting again from the
+// latest closed bucket would leave a hole in the data.
+export async function readState(bucket) {
+  let body
+  try {
+    const response = await s3.send(
+      new GetObjectCommand({ Bucket: bucket, Key: STATE_KEY })
+    )
+    body = await response.Body.transformToString()
+  } catch (err) {
+    if (isNotFound(err)) return {}
+    throw err
+  }
+  let state
+  try {
+    state = JSON.parse(body)
+  } catch (err) {
+    throw new Error(`${STATE_KEY} is not valid JSON: ${err.message}`)
+  }
+  if (state === null || typeof state !== 'object' || Array.isArray(state)) {
+    throw new Error(`${STATE_KEY} is not a JSON object`)
+  }
+  return state
+}
+
+export async function writeState(bucket, state) {
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: STATE_KEY,
+      Body: JSON.stringify(state),
+      ContentType: 'application/json'
+    })
+  )
 }

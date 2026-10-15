@@ -4,16 +4,19 @@ import { gunzipSync } from 'node:zlib'
 
 import { s3Stub } from './stub-s3.mjs'
 import {
+  STATE_KEY,
   bucketStarts,
   dayKey,
   dayKeysForRange,
   decodeDay,
   encodeDay,
   readDay,
+  readState,
   splitByUtcDay,
   toSlots,
   upsertDay,
   upsertSlots,
+  writeState,
   zeroFill
 } from './store.mjs'
 
@@ -249,5 +252,22 @@ describe('readDay and upsertDay', () => {
       }
     }
     await assert.rejects(readDay('bucket', 'k'), denied)
+  })
+})
+
+describe('readState and writeState', () => {
+  beforeEach(() => s3Stub.reset())
+
+  it('gives an empty state when the object does not exist', async () => {
+    assert.deepEqual(await readState('bucket'), {})
+  })
+
+  it('writes plain JSON and reads it back', async () => {
+    const state = { logs: '2026-10-06T12:00:00Z' }
+    await writeState('bucket', state)
+    const object = s3Stub.objects.get(STATE_KEY)
+    assert.equal(object.ContentType, 'application/json')
+    assert.equal(object.ContentEncoding, undefined)
+    assert.deepEqual(await readState('bucket'), state)
   })
 })

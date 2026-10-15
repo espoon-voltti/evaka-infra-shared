@@ -208,6 +208,7 @@ resource "aws_lambda_function" "collector" {
       BUCKET                  = aws_s3_bucket.ops_metrics.bucket
       SERVICE_LOG_GROUP_NAME  = var.service_log_group_name
       RDS_INSTANCE_IDENTIFIER = var.rds_instance_identifier
+      INGESTION_DELAY_SECONDS = var.ingestion_delay_seconds
     }
   }
 }
