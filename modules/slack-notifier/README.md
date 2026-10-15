@@ -23,6 +23,12 @@ Forwards CloudWatch alarm state changes and application log errors to Slack.
   concurrently, and a scan that fails outright — a denied query, more log
   groups than one query accepts — posts a warning rather than staying quiet,
   so a broken source is not mistaken for a clean one.
+- A daily EventBridge schedule (`cron(0 5 * * ? *)` by default) that has the
+  lambda list the alarms still in `ALARM` state and post them to Slack as one
+  message, see [Alarm reminder](#alarm-reminder). CloudWatch notifies once per
+  state change, so without this an alarm that fired days ago and was never
+  fixed is only as visible as its original message. On by default, off with
+  `alarm_reminder_enabled = false`.
 - Optional CloudWatch **metric alarms** (`var.metric_alarms`, plus a built-in
   backup-failed alarm via `var.backup_failed_alarm_enabled`) wired to
   `var.alarm_sns_topic_arn`, so metric breaches are forwarded to Slack through
@@ -191,6 +197,37 @@ log_sources = {
   indexing delay in the past), and an entry near a window boundary can be
   reported twice.
 
+### Alarm reminder
+
+Once a day the lambda calls `DescribeAlarms` and posts one message listing
+every alarm in `ALARM` state, oldest first, each with a console link, its
+description and how long it has been red. Nothing is posted when no alarm is
+red.
+
+Only alarms whose **alarm actions include `alarm_sns_topic_arn`** are listed.
+This is what tells an alarm meant for a human apart from one that exists to
+drive something else, an autoscaling policy for one, which is red by design
+whenever the thing it drives is idle. The reminder needs no ignore list: an
+alarm that does not notify Slack when it fires is not reminded about either.
+
+`DescribeAlarms` is regional, so the reminder covers the lambda's own region.
+An alarm in another region that forwards to this lambda through a topic of its
+own is not listed.
+
+To run the reminder on demand, send the lambda the same event the schedule
+sends. The result says how many alarms it found and whether it posted:
+
+```sh
+aws lambda invoke \
+  --function-name <name_prefix>-slack-notifier \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"action":"alarm-reminder"}' \
+  /dev/stdout
+```
+
+This works in an account that has `alarm_reminder_enabled = false` too: the
+flag removes the schedule, not the lambda's `DescribeAlarms` grant.
+
 ### Metric alarms and region
 
 `metric_alarms` and the built-in backup alarm are created in the **provider
@@ -203,20 +240,22 @@ account-level (empty-dimension) metric does not report data.
 
 ## Inputs
 
-| Name                             | Type           | Required | Default | Description                                                                                                                                                                                                                                                        |
-| -------------------------------- | -------------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `name_prefix`                    | `string`       | yes      | —       | Prefix for the lambda function, IAM role, and EventBridge rule. Example: `"evakaturku-prod"`.                                                                                                                                                                      |
-| `account_id`                     | `string`       | yes      | —       | AWS account ID, used for IAM resource ARNs.                                                                                                                                                                                                                        |
-| `alarm_sns_topic_arn`            | `string`       | yes      | —       | SNS topic the lambda subscribes to for alarm state changes.                                                                                                                                                                                                        |
-| `slack_webhook_ssm_name`         | `string`       | yes      | —       | Name of the SecureString SSM parameter holding the Slack webhook URL.                                                                                                                                                                                              |
-| `slack_channel`                  | `string`       | no       | `null`  | Slack channel to post to (e.g. `"#alerts"`), overriding the webhook's own default channel. Needed only where the webhook is shared with other channels rather than dedicated to this deployment.                                                                   |
-| `slack_webhook_kms_arn`          | `string`       | no       | `""`    | KMS key ARN. Leave empty if the SSM parameter is encrypted with `aws/ssm`.                                                                                                                                                                                         |
-| `log_group_names`                | `list(string)` | no       | `[]`    | CloudWatch log groups to scan and to use for trace-id deep-links. Empty turns the scheduled scan off entirely (no schedule, no Insights grants), leaving an alarm-forwarder-only deployment. The query is eVaka-specific, so other consumers normally want it off. |
-| `log_sources`                    | `map(object)`  | no       | `{}`    | Additional, per-source log scans for other applications' field-name conventions. See [Generalized log scanning](#generalized-log-scanning-log_sources).                                                                                                            |
-| `log_query_seconds`              | `number`       | no       | `300`   | Sliding window for the log-error scan (`log_group_names` and every `log_sources` entry). The 5-minute schedule is hardcoded and assumes this cadence.                                                                                                              |
-| `metric_alarms`                  | `map(object)`  | no       | `{}`    | CloudWatch metric alarms to create, keyed by alarm-name suffix. Routed to `alarm_sns_topic_arn`. Per-alarm `notify_on_ok` (default `true`) controls whether the green "recovered" message is sent. See variable for fields/defaults.                               |
-| `backup_failed_alarm_enabled`    | `bool`         | no       | `true`  | Create a built-in `backup-failed` alarm (AWS/Backup `NumberOfBackupJobsFailed`, Sum over 1h > 0). On by default; auto-skipped when `alarm_sns_topic_arn` is null. Set `false` to opt out.                                                                          |
-| `backup_failed_alarm_dimensions` | `map(string)`  | no       | `{}`    | Dimensions for the built-in backup alarm. Empty = account/region-level; set `{ BackupVaultName = "..." }` to scope to a vault.                                                                                                                                     |
+| Name                                 | Type           | Required | Default             | Description                                                                                                                                                                                                                                                        |
+| ------------------------------------ | -------------- | -------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name_prefix`                        | `string`       | yes      | —                   | Prefix for the lambda function, IAM role, and EventBridge rule. Example: `"evakaturku-prod"`.                                                                                                                                                                      |
+| `account_id`                         | `string`       | yes      | —                   | AWS account ID, used for IAM resource ARNs.                                                                                                                                                                                                                        |
+| `alarm_sns_topic_arn`                | `string`       | yes      | —                   | SNS topic the lambda subscribes to for alarm state changes.                                                                                                                                                                                                        |
+| `slack_webhook_ssm_name`             | `string`       | yes      | —                   | Name of the SecureString SSM parameter holding the Slack webhook URL.                                                                                                                                                                                              |
+| `slack_channel`                      | `string`       | no       | `null`              | Slack channel to post to (e.g. `"#alerts"`), overriding the webhook's own default channel. Needed only where the webhook is shared with other channels rather than dedicated to this deployment.                                                                   |
+| `slack_webhook_kms_arn`              | `string`       | no       | `""`                | KMS key ARN. Leave empty if the SSM parameter is encrypted with `aws/ssm`.                                                                                                                                                                                         |
+| `log_group_names`                    | `list(string)` | no       | `[]`                | CloudWatch log groups to scan and to use for trace-id deep-links. Empty turns the scheduled scan off entirely (no schedule, no Insights grants), leaving an alarm-forwarder-only deployment. The query is eVaka-specific, so other consumers normally want it off. |
+| `log_sources`                        | `map(object)`  | no       | `{}`                | Additional, per-source log scans for other applications' field-name conventions. See [Generalized log scanning](#generalized-log-scanning-log_sources).                                                                                                            |
+| `log_query_seconds`                  | `number`       | no       | `300`               | Sliding window for the log-error scan (`log_group_names` and every `log_sources` entry). The 5-minute schedule is hardcoded and assumes this cadence.                                                                                                              |
+| `metric_alarms`                      | `map(object)`  | no       | `{}`                | CloudWatch metric alarms to create, keyed by alarm-name suffix. Routed to `alarm_sns_topic_arn`. Per-alarm `notify_on_ok` (default `true`) controls whether the green "recovered" message is sent. See variable for fields/defaults.                               |
+| `backup_failed_alarm_enabled`        | `bool`         | no       | `true`              | Create a built-in `backup-failed` alarm (AWS/Backup `NumberOfBackupJobsFailed`, Sum over 1h > 0). On by default; auto-skipped when `alarm_sns_topic_arn` is null. Set `false` to opt out.                                                                          |
+| `backup_failed_alarm_dimensions`     | `map(string)`  | no       | `{}`                | Dimensions for the built-in backup alarm. Empty = account/region-level; set `{ BackupVaultName = "..." }` to scope to a vault.                                                                                                                                     |
+| `alarm_reminder_enabled`             | `bool`         | no       | `true`              | Post a daily list of the alarms still in `ALARM` state whose actions include `alarm_sns_topic_arn`. Auto-skipped when the topic is null. Set `false` where red alarms are expected. See [Alarm reminder](#alarm-reminder).                                         |
+| `alarm_reminder_schedule_expression` | `string`       | no       | `cron(0 5 * * ? *)` | EventBridge schedule for the alarm reminder.                                                                                                                                                                                                                       |
 
 When `metric_alarms` is non-empty, `alarm_sns_topic_arn` must be set (enforced
 by a precondition). The built-in backup alarm instead self-skips when the topic

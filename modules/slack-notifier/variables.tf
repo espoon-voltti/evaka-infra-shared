@@ -138,3 +138,15 @@ variable "backup_failed_alarm_dimensions" {
   type        = map(string)
   default     = {}
 }
+
+variable "alarm_reminder_enabled" {
+  description = "Schedule a daily Slack message listing the alarms still in ALARM state, so one that fired and was never fixed does not stay buried in the channel history. Only alarms with alarm_sns_topic_arn among their alarm actions are listed, which leaves out alarms that exist to drive something else (autoscaling, for one). Enabled by default; automatically skipped when alarm_sns_topic_arn is null. Set to false for an account whose red alarms are expected, such as one scaled to zero pending removal. The lambda still answers a manual invocation with {\"action\": \"alarm-reminder\"} when this is false."
+  type        = bool
+  default     = true
+}
+
+variable "alarm_reminder_schedule_expression" {
+  description = "EventBridge schedule for the alarm reminder. The default runs once a day at 05:00 UTC."
+  type        = string
+  default     = "cron(0 5 * * ? *)"
+}

@@ -1,8 +1,12 @@
 data "aws_partition" "current" {}
 
 locals {
-  function_name = "${var.name_prefix}-slack-notifier"
-  rule_name     = "${var.name_prefix}-slack-notifier-log-error-check"
+  function_name      = "${var.name_prefix}-slack-notifier"
+  rule_name          = "${var.name_prefix}-slack-notifier-log-error-check"
+  reminder_rule_name = "${var.name_prefix}-slack-notifier-alarm-reminder"
+
+  # Without a topic no alarm routes to Slack, so there is nothing to remind about.
+  alarm_reminder_enabled = var.alarm_reminder_enabled && var.alarm_sns_topic_arn != null
 
   # No log groups to scan means the scheduled scan has nothing to do: skip the
   # schedule and the Insights grants, leaving an alarm-forwarder-only deployment.
@@ -61,6 +65,16 @@ locals {
     }] : [],
   )
 
+  # Granted whenever there is a topic, not only with the schedule on, so a manual
+  # alarm-reminder invocation works in an account that has the schedule off.
+  alarm_reminder_iam_statements = var.alarm_sns_topic_arn != null ? [
+    {
+      Effect   = "Allow"
+      Action   = ["cloudwatch:DescribeAlarms"]
+      Resource = "arn:${data.aws_partition.current.partition}:cloudwatch:*:${var.account_id}:alarm:*"
+    }
+  ] : []
+
   kms_iam_statements = var.slack_webhook_kms_arn != "" ? [
     {
       Effect   = "Allow"
@@ -106,6 +120,7 @@ data "archive_file" "slack_notifier" {
     "slack_notifier.test.mjs",
     "stub-ssm.mjs",
     "stub-cloudwatch-logs.mjs",
+    "stub-cloudwatch.mjs",
     "mock-aws-loader.mjs",
     "slack_notifier.zip"
   ]
@@ -137,6 +152,7 @@ resource "aws_iam_role_policy" "slack_notifier" {
     Statement = concat(
       local.base_iam_statements,
       local.log_scan_iam_statements,
+      local.alarm_reminder_iam_statements,
       local.kms_iam_statements,
     )
   })
@@ -161,6 +177,7 @@ resource "aws_lambda_function" "slack_notifier" {
       LOG_GROUP_NAMES        = join(",", var.log_group_names)
       LOG_QUERY_SECONDS      = tostring(var.log_query_seconds)
       LOG_SOURCES_JSON       = jsonencode(var.log_sources)
+      ALARM_SNS_TOPIC_ARN    = var.alarm_sns_topic_arn != null ? var.alarm_sns_topic_arn : ""
     }
   }
 }
@@ -238,4 +255,33 @@ resource "aws_lambda_permission" "eventbridge_invoke" {
   function_name = aws_lambda_function.slack_notifier.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.log_error_check[0].arn
+}
+
+# EventBridge schedule: once a day, list the alarms still in ALARM state. The
+# constant input is the same event a manual `aws lambda invoke` sends to run the
+# reminder on demand.
+resource "aws_cloudwatch_event_rule" "alarm_reminder" {
+  count = local.alarm_reminder_enabled ? 1 : 0
+
+  name                = local.reminder_rule_name
+  description         = "Remind Slack of alarms still in ALARM state"
+  schedule_expression = var.alarm_reminder_schedule_expression
+}
+
+resource "aws_cloudwatch_event_target" "alarm_reminder" {
+  count = local.alarm_reminder_enabled ? 1 : 0
+
+  rule  = aws_cloudwatch_event_rule.alarm_reminder[0].name
+  arn   = aws_lambda_function.slack_notifier.arn
+  input = jsonencode({ action = "alarm-reminder" })
+}
+
+resource "aws_lambda_permission" "eventbridge_invoke_alarm_reminder" {
+  count = local.alarm_reminder_enabled ? 1 : 0
+
+  statement_id  = "AllowEventBridgeInvokeAlarmReminder"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.slack_notifier.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.alarm_reminder[0].arn
 }

@@ -5,7 +5,11 @@ const STUBS = {
     './stub-cloudwatch-logs.mjs',
     import.meta.url
   ).href,
-  '@aws-sdk/client-ssm': new URL('./stub-ssm.mjs', import.meta.url).href
+  '@aws-sdk/client-ssm': new URL('./stub-ssm.mjs', import.meta.url).href,
+  '@aws-sdk/client-cloudwatch': new URL(
+    './stub-cloudwatch.mjs',
+    import.meta.url
+  ).href
 }
 
 export function resolve(specifier, context, nextResolve) {
