@@ -1,4 +1,4 @@
-import { describe, it, beforeEach } from 'node:test'
+import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { cloudwatchLogsStub } from './stub-cloudwatch-logs.mjs'
@@ -683,5 +683,127 @@ describe('handler', () => {
       next: { from: '2026-10-01T12:00:00Z', to: '2026-10-03T00:00:00Z' }
     })
     assert.equal(storedDay('5min/2026/10/02.json'), null)
+  })
+})
+
+describe('handler with the apigw and proxy log groups', () => {
+  beforeEach(() => {
+    cloudwatchLogsStub.reset()
+    cloudwatchStub.reset()
+    s3Stub.reset()
+    process.env.APIGW_LOG_GROUP_NAME = 'evaka-apigw-staging'
+    process.env.PROXY_LOG_GROUP_NAME = 'evaka-proxy-staging'
+  })
+
+  afterEach(() => {
+    delete process.env.APIGW_LOG_GROUP_NAME
+    delete process.env.PROXY_LOG_GROUP_NAME
+  })
+
+  function startedQueries() {
+    return cloudwatchLogsStub.calls
+      .filter((c) => c.input.queryString)
+      .map((c) => [
+        c.input.logGroupNames,
+        isoSeconds(c.input.startTime),
+        isoSeconds(c.input.endTime)
+      ])
+  }
+
+  it('makes exactly one query for each log group on a run', async () => {
+    setStoredState({
+      service: '2026-10-06T12:00:00Z',
+      apigw: '2026-10-06T12:00:00Z',
+      proxy: '2026-10-06T12:00:00Z',
+      metrics: '2026-10-06T12:00:00Z'
+    })
+    queueEmptyQueryResults(3)
+
+    await runScheduled('2026-10-06T12:11:00Z')
+
+    assert.deepEqual(startedQueries(), [
+      [['evaka-srv-staging'], '2026-10-06T12:00:00Z', '2026-10-06T12:05:00Z'],
+      [['evaka-apigw-staging'], '2026-10-06T12:00:00Z', '2026-10-06T12:05:00Z'],
+      [['evaka-proxy-staging'], '2026-10-06T12:00:00Z', '2026-10-06T12:05:00Z']
+    ])
+    assert.equal(cloudwatchStub.calls.length, 1)
+    assert.deepEqual(storedState(), {
+      service: '2026-10-06T12:05:00Z',
+      apigw: '2026-10-06T12:05:00Z',
+      proxy: '2026-10-06T12:05:00Z',
+      metrics: '2026-10-06T12:05:00Z'
+    })
+    const slot = storedDay('5min/2026/10/06.json').slots[0]
+    assert.equal(slot['apigw.requests{app=citizen,class=2xx}'], 0)
+    assert.equal(slot['proxy.status502'], 0)
+    assert.equal(slot['service.errors'], 0)
+  })
+
+  it('makes one query for each log group when it catches up', async () => {
+    setStoredState({
+      service: '2026-10-05T12:00:00Z',
+      apigw: '2026-10-05T12:00:00Z',
+      proxy: '2026-10-05T12:00:00Z',
+      metrics: '2026-10-06T12:00:00Z'
+    })
+    queueEmptyQueryResults(3)
+
+    await runScheduled('2026-10-06T12:06:00Z')
+
+    assert.deepEqual(startedQueries(), [
+      [['evaka-srv-staging'], '2026-10-05T12:00:00Z', '2026-10-06T00:00:00Z'],
+      [['evaka-apigw-staging'], '2026-10-05T12:00:00Z', '2026-10-06T00:00:00Z'],
+      [['evaka-proxy-staging'], '2026-10-05T12:00:00Z', '2026-10-06T12:00:00Z']
+    ])
+  })
+
+  it('starts a log group without a watermark at the latest closed bucket', async () => {
+    setStoredState({
+      service: '2026-10-06T12:00:00Z',
+      metrics: '2026-10-06T12:00:00Z'
+    })
+    queueEmptyQueryResults(3)
+
+    await runScheduled('2026-10-06T12:16:00Z')
+
+    assert.deepEqual(startedQueries(), [
+      [['evaka-srv-staging'], '2026-10-06T12:00:00Z', '2026-10-06T12:10:00Z'],
+      [['evaka-apigw-staging'], '2026-10-06T12:05:00Z', '2026-10-06T12:10:00Z'],
+      [['evaka-proxy-staging'], '2026-10-06T12:05:00Z', '2026-10-06T12:10:00Z']
+    ])
+  })
+
+  it('keeps the watermark of a failed log group and advances the others', async () => {
+    setStoredState({
+      service: '2026-10-06T12:00:00Z',
+      apigw: '2026-10-06T12:00:00Z',
+      proxy: '2026-10-06T12:00:00Z',
+      metrics: '2026-10-06T12:00:00Z'
+    })
+    cloudwatchLogsStub.queryResults = [
+      { status: 'Complete', results: [] },
+      { status: 'Failed' },
+      { status: 'Complete', results: [] }
+    ]
+
+    await assert.rejects(runScheduled('2026-10-06T12:11:00Z'), /apigw: /)
+
+    assert.deepEqual(storedState(), {
+      service: '2026-10-06T12:05:00Z',
+      apigw: '2026-10-06T12:00:00Z',
+      proxy: '2026-10-06T12:05:00Z',
+      metrics: '2026-10-06T12:05:00Z'
+    })
+    const day = storedDay('5min/2026/10/06.json')
+    assert.ok('proxy.status504' in day.series)
+    assert.ok('service.errors' in day.series)
+    assert.equal(
+      Object.keys(day.series).some((name) => name.startsWith('apigw.')),
+      false
+    )
+    assert.equal(
+      Object.keys(day.slots[0]).some((name) => name.startsWith('apigw.')),
+      false
+    )
   })
 })

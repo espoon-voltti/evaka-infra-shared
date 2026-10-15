@@ -9,8 +9,20 @@ variable "account_id" {
 }
 
 variable "service_log_group_name" {
-  description = "Log group of the eVaka service. The collector reads the audit events in it with Logs Insights."
+  description = "Log group of the eVaka service. The collector counts its lines with Logs Insights."
   type        = string
+}
+
+variable "apigw_log_group_name" {
+  description = "Log group of the eVaka API gateway. Null leaves out its series."
+  type        = string
+  default     = null
+}
+
+variable "proxy_log_group_name" {
+  description = "Log group of the eVaka nginx proxy. Null leaves out its series."
+  type        = string
+  default     = null
 }
 
 variable "rds_instance_identifier" {

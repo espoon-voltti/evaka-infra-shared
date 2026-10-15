@@ -7,6 +7,10 @@ locals {
 
   bucket_objects_arn = "${aws_s3_bucket.ops_metrics.arn}/*"
 
+  insights_log_group_names = [
+    for name in [var.service_log_group_name, var.apigw_log_group_name, var.proxy_log_group_name] : name if name != null
+  ]
+
   # S3 answers 403 instead of 404 for a missing key when the caller cannot list
   # the bucket. The collector must see 404 to start a new day file, and the
   # page must see 404 through a presigned URL to show a gap.
@@ -26,7 +30,7 @@ locals {
       {
         Effect   = "Allow"
         Action   = ["logs:StartQuery"]
-        Resource = "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:${var.service_log_group_name}:*"
+        Resource = [for name in local.insights_log_group_names : "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:${name}:*"]
       },
       {
         Effect   = "Allow"
@@ -205,12 +209,16 @@ resource "aws_lambda_function" "collector" {
   source_code_hash               = data.archive_file.ops_metrics.output_base64sha256
 
   environment {
-    variables = {
-      BUCKET                  = aws_s3_bucket.ops_metrics.bucket
-      SERVICE_LOG_GROUP_NAME  = var.service_log_group_name
-      RDS_INSTANCE_IDENTIFIER = var.rds_instance_identifier
-      INGESTION_DELAY_SECONDS = var.ingestion_delay_seconds
-    }
+    variables = merge(
+      {
+        BUCKET                  = aws_s3_bucket.ops_metrics.bucket
+        SERVICE_LOG_GROUP_NAME  = var.service_log_group_name
+        RDS_INSTANCE_IDENTIFIER = var.rds_instance_identifier
+        INGESTION_DELAY_SECONDS = var.ingestion_delay_seconds
+      },
+      var.apigw_log_group_name != null ? { APIGW_LOG_GROUP_NAME = var.apigw_log_group_name } : {},
+      var.proxy_log_group_name != null ? { PROXY_LOG_GROUP_NAME = var.proxy_log_group_name } : {},
+    )
   }
 }
 

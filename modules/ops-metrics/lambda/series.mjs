@@ -7,8 +7,29 @@ export const RESPONSE_TIME_BOUNDS = [
   10000
 ]
 
+export const STATUS_CLASSES = ['2xx', '3xx', '4xx', '5xx']
+
+const APIGW_APPS = ['citizen', 'mobile', 'employee', 'other']
+
 const COUNTER = { type: 'counter' }
 const RESPONSE_TIME = { type: 'histogram', bounds: RESPONSE_TIME_BOUNDS }
+
+export function withLabels(name, labels) {
+  const pairs = Object.entries(labels).map(([key, value]) => `${key}=${value}`)
+  return `${name}{${pairs.join(',')}}`
+}
+
+export const APIGW_REQUEST_SERIES = Object.fromEntries(
+  APIGW_APPS.flatMap((app) => [
+    ...STATUS_CLASSES.map((statusClass) => [
+      withLabels('apigw.requests', { app, class: statusClass }),
+      COUNTER
+    ]),
+    [withLabels('apigw.status401', { app }), COUNTER],
+    [withLabels('apigw.status429', { app }), COUNTER],
+    [withLabels('apigw.responseTime', { app }), RESPONSE_TIME]
+  ])
+)
 
 const SERIES = {
   'citizen.login{auth=strong}': COUNTER,
@@ -39,7 +60,21 @@ const SERIES = {
   'integration.failed{system=dvv}': COUNTER,
   'vtj.requests{result=ok}': COUNTER,
   'vtj.requests{result=error}': COUNTER,
-  'sanityCheck.failed': COUNTER
+  'sanityCheck.failed': COUNTER,
+
+  ...APIGW_REQUEST_SERIES,
+  'login.failed{method=sfi}': COUNTER,
+  'login.failed{method=ad}': COUNTER,
+  'login.failed{method=weak}': COUNTER,
+  'login.failed{method=passkey}': COUNTER,
+  'login.rateLimited': COUNTER,
+
+  'proxy.requests{class=2xx}': COUNTER,
+  'proxy.requests{class=3xx}': COUNTER,
+  'proxy.requests{class=4xx}': COUNTER,
+  'proxy.requests{class=5xx}': COUNTER,
+  'proxy.status502': COUNTER,
+  'proxy.status504': COUNTER
 }
 
 // The collector also writes these series for each job type, with the label
@@ -48,11 +83,6 @@ export const JOB_TYPE_SERIES = [
   'service.asyncJob.failed',
   'service.asyncJob.permanentlyFailed'
 ]
-
-export function withLabels(name, labels) {
-  const pairs = Object.entries(labels).map(([key, value]) => `${key}=${value}`)
-  return `${name}{${pairs.join(',')}}`
-}
 
 function metaOf(name) {
   const [base] = name.split('{')

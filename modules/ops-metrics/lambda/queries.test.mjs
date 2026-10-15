@@ -3,11 +3,17 @@ import assert from 'node:assert/strict'
 
 import { RESPONSE_TIME_BOUNDS, seriesMeta } from './series.mjs'
 import {
+  APIGW_QUERY,
+  APIGW_SERIES,
+  APIGW_SERIES_BY_EVENT_CODE,
+  PROXY_SERIES,
   SERVICE_QUERY,
   SERVICE_SERIES,
   SERVICE_SERIES_BY_EVENT_CODE,
   SERVICE_SERIES_BY_MESSAGE,
   SERVICE_SERIES_BY_VTJ_STATUS,
+  apigwValuesFromRows,
+  proxyValuesFromRows,
   serviceValuesFromRows
 } from './queries.mjs'
 
@@ -22,8 +28,10 @@ function listAfter(query, prefix) {
   return JSON.parse(match[1])
 }
 
-function parseRegex(query) {
-  const [, source] = /\| parse message \/(.*)\/$/m.exec(query)
+function parseRegex(query, field) {
+  const [, source] = new RegExp(`\\| parse ${field} \\/(.*)\\/$`, 'm').exec(
+    query
+  )
   return new RegExp(source)
 }
 
@@ -66,7 +74,7 @@ describe('SERVICE_QUERY', () => {
   })
 
   it('captures the message kind of each eVaka message that maps to a series', () => {
-    const regex = parseRegex(SERVICE_QUERY)
+    const regex = parseRegex(SERVICE_QUERY, 'message')
     const messages = {
       'Failed to run async job ClaimedJobRef(jobId=4f0c, jobType=SendMessage, remainingAttempts=2)':
         'Failed to run async job',
@@ -95,7 +103,7 @@ describe('SERVICE_QUERY', () => {
   })
 
   it('counts each failed Varda update once with the line of its client request', () => {
-    const regex = parseRegex(SERVICE_QUERY)
+    const regex = parseRegex(SERVICE_QUERY, 'message')
     const clientLine =
       'request failed POST https://varda.example/api/v1/toimipaikat/: status=400 body=x'
     for (const updateLine of [
@@ -111,7 +119,7 @@ describe('SERVICE_QUERY', () => {
   })
 
   it('does not capture other messages that mention a failure', () => {
-    const regex = parseRegex(SERVICE_QUERY)
+    const regex = parseRegex(SERVICE_QUERY, 'message')
     for (const message of [
       'Nekku API request failed with code 500: error',
       'Message request failed with HTTP 500 Internal Server Error: body',
@@ -368,6 +376,206 @@ describe('serviceValuesFromRows', () => {
     assert.deepEqual(
       seriesMeta(['service.asyncJob.failed{type=SendMessage}']),
       { 'service.asyncJob.failed{type=SendMessage}': { type: 'counter' } }
+    )
+  })
+})
+
+describe('APIGW_QUERY', () => {
+  it('filters by every event code that maps to a series', () => {
+    assert.deepEqual(
+      listAfter(APIGW_QUERY, 'eventCode in'),
+      Object.keys(APIGW_SERIES_BY_EVENT_CODE)
+    )
+  })
+
+  it('captures the app from the path prefix', () => {
+    const regex = parseRegex(APIGW_QUERY, 'path')
+    const paths = {
+      '/api/citizen/children': 'citizen',
+      '/api/citizen/auth/weak-login': 'citizen',
+      '/api/employee/units/1': 'employee',
+      '/api/employee-mobile/units/1': 'employee-mobile',
+      '/api/employee-mobile/auth/pin-login': 'employee-mobile',
+      '/api/application/auth/saml/login/callback': undefined,
+      '/api/internal/auth/saml/login/callback': undefined,
+      '/api/csp': undefined,
+      '/api/citizen': undefined
+    }
+    for (const [path, app] of Object.entries(paths)) {
+      assert.equal(regex.exec(path)?.groups.pathApp, app, path)
+    }
+  })
+})
+
+describe('APIGW_SERIES', () => {
+  it('has 16 request counts, 4 of each status and histogram, and the logins', () => {
+    const apps = ['citizen', 'mobile', 'employee', 'other']
+    assert.deepEqual(
+      new Set(APIGW_SERIES),
+      new Set([
+        ...apps.flatMap((app) =>
+          ['2xx', '3xx', '4xx', '5xx'].map(
+            (c) => `apigw.requests{app=${app},class=${c}}`
+          )
+        ),
+        ...apps.map((app) => `apigw.status401{app=${app}}`),
+        ...apps.map((app) => `apigw.status429{app=${app}}`),
+        ...apps.map((app) => `apigw.responseTime{app=${app}}`),
+        'login.failed{method=sfi}',
+        'login.failed{method=ad}',
+        'login.failed{method=weak}',
+        'login.failed{method=passkey}',
+        'login.rateLimited'
+      ])
+    )
+    assert.equal(APIGW_SERIES.length, 33)
+  })
+})
+
+describe('apigwValuesFromRows', () => {
+  function apigwRow(fields) {
+    return { t: T0, k: 'other', rt: '0', ...fields }
+  }
+
+  it('maps each kind of row to its series', () => {
+    const values = apigwValuesFromRows(
+      [
+        apigwRow({
+          type: 'app-requests-received',
+          k: 'citizen',
+          rt: '4',
+          n: '20',
+          n2xx: '15',
+          n3xx: '1',
+          n4xx: '3',
+          n5xx: '1',
+          n401: '2',
+          n429: '1'
+        }),
+        apigwRow({
+          type: 'app-requests-received',
+          k: 'citizen',
+          rt: '12',
+          n: '1',
+          n2xx: '0',
+          n3xx: '0',
+          n4xx: '0',
+          n5xx: '1',
+          n401: '0',
+          n429: '0'
+        }),
+        apigwRow({
+          type: 'app-requests-received',
+          k: 'employee-mobile',
+          rt: '5',
+          n: '3',
+          n2xx: '3',
+          n3xx: '0',
+          n4xx: '0',
+          n5xx: '0',
+          n401: '0',
+          n429: '0'
+        }),
+        apigwRow({
+          type: 'app-requests-received',
+          k: 'other',
+          rt: '3',
+          n: '2',
+          n2xx: '0',
+          n3xx: '2',
+          n4xx: '0',
+          n5xx: '0',
+          n401: '0',
+          n429: '0'
+        }),
+        apigwRow({
+          type: 'app-audit-events',
+          k: 'evaka.saml.suomifi.sign_in_failed',
+          rt: '-1',
+          n: '1'
+        }),
+        apigwRow({
+          type: 'app-audit-events',
+          k: 'evaka.citizen_weak.sign_in_failed',
+          rt: '-1',
+          n: '4'
+        }),
+        apigwRow({ type: 'app-misc', rt: '-1', n: '2' })
+      ],
+      FROM,
+      TO
+    )
+    const slot = values.get(FROM)
+    assert.equal(slot['apigw.requests{app=citizen,class=2xx}'], 15)
+    assert.equal(slot['apigw.requests{app=citizen,class=4xx}'], 3)
+    assert.equal(slot['apigw.requests{app=citizen,class=5xx}'], 2)
+    assert.equal(slot['apigw.status401{app=citizen}'], 2)
+    assert.equal(slot['apigw.status429{app=citizen}'], 1)
+    const citizenTimes = new Array(13).fill(0)
+    citizenTimes[4] = 20
+    citizenTimes[12] = 1
+    assert.deepEqual(slot['apigw.responseTime{app=citizen}'], citizenTimes)
+    assert.equal(slot['apigw.requests{app=mobile,class=2xx}'], 3)
+    assert.equal(slot['apigw.requests{app=other,class=3xx}'], 2)
+    assert.equal(slot['apigw.requests{app=employee,class=2xx}'], 0)
+    assert.deepEqual(
+      slot['apigw.responseTime{app=employee}'],
+      new Array(13).fill(0)
+    )
+    assert.equal(slot['login.failed{method=sfi}'], 1)
+    assert.equal(slot['login.failed{method=weak}'], 4)
+    assert.equal(slot['login.failed{method=ad}'], 0)
+    assert.equal(slot['login.rateLimited'], 2)
+    assert.deepEqual(Object.keys(slot).sort(), [...APIGW_SERIES].sort())
+  })
+
+  it('zero-fills every series in each bucket of the range', () => {
+    const values = apigwValuesFromRows([], FROM, TO)
+    assert.equal(values.size, 2)
+    for (const slot of values.values()) {
+      assert.deepEqual(Object.keys(slot).sort(), [...APIGW_SERIES].sort())
+      assert.equal(slot['apigw.status429{app=other}'], 0)
+      assert.deepEqual(
+        slot['apigw.responseTime{app=mobile}'],
+        new Array(13).fill(0)
+      )
+    }
+  })
+})
+
+describe('proxyValuesFromRows', () => {
+  it('maps the status class and gateway error counts', () => {
+    const values = proxyValuesFromRows(
+      [
+        {
+          t: T0,
+          n: '120',
+          n2xx: '100',
+          n3xx: '10',
+          n4xx: '5',
+          n5xx: '4',
+          n502: '3',
+          n504: '1'
+        }
+      ],
+      FROM,
+      TO
+    )
+    assert.deepEqual(values.get(FROM), {
+      'proxy.requests{class=2xx}': 100,
+      'proxy.requests{class=3xx}': 10,
+      'proxy.requests{class=4xx}': 5,
+      'proxy.requests{class=5xx}': 4,
+      'proxy.status502': 3,
+      'proxy.status504': 1
+    })
+  })
+
+  it('zero-fills every series in each bucket of the range', () => {
+    const values = proxyValuesFromRows([], FROM, TO)
+    assert.deepEqual(
+      [...values.values()],
+      [0, 1].map(() => Object.fromEntries(PROXY_SERIES.map((n) => [n, 0])))
     )
   })
 })

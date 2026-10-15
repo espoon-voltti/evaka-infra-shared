@@ -13,10 +13,11 @@ page presigned URLs to the files.
   deletes the 5-minute files after `raw_retention_days`.
 - A collector Lambda (`<name_prefix>-ops-metrics-collector`, Node.js 24, ARM64)
   and an EventBridge schedule (`collector_schedule`, by default
-  `cron(1/5 * * * ? *)`). It counts the lines of `service_log_group_name` with
-  one Logs Insights query, reads the RDS `CPUUtilization` of
-  `rds_instance_identifier` with one `GetMetricData` call, and writes them to
-  the day file. Its reserved concurrency is 1, so two runs
+  `cron(1/5 * * * ? *)`). It counts the lines of `service_log_group_name`,
+  and of `apigw_log_group_name` and `proxy_log_group_name` when they are set,
+  with one Logs Insights query for each log group. It reads the RDS
+  `CPUUtilization` of `rds_instance_identifier` with one `GetMetricData` call,
+  and writes them to the day file. Its reserved concurrency is 1, so two runs
   cannot write the same file at the same time. It keeps its progress in
   `state/collector.json` in the same bucket.
 - A read Lambda (`<name_prefix>-ops-metrics-reader`) with a public Function URL.
@@ -77,7 +78,7 @@ file, use `aws s3 cp s3://<bucket>/5min/2026/10/06.json - | gunzip | jq`.
 - A series with a job type label is not zero-filled. A missing key means 0
   when the slot has the series of the same name without the label.
 
-| Series                                                                        | Type         | From                                                                                                                                     |
+| Series                                                                        | Type         | From (service log group)                                                                                                                 |
 | ----------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `citizen.login{auth=strong}`                                                  | counter      | Audit `CitizenLogin`                                                                                                                     |
 | `citizen.login{auth=weak}`                                                    | counter      | Audit `CitizenWeakLogin`, `CitizenPasskeyLogin`                                                                                          |
@@ -100,6 +101,24 @@ file, use `aws s3 cp s3://<bucket>/5min/2026/10/06.json - | gunzip | jq`.
 update once. The Varda client line "request failed" that comes before it does
 not count.
 
+The `app` label of the API gateway series is the path prefix of the request:
+`/api/citizen/` is `citizen`, `/api/employee-mobile/` is `mobile`,
+`/api/employee/` is `employee`, and all other paths are `other`, for example
+the Suomi.fi SAML callback `/api/application/auth/saml/`.
+
+| Series                                                     | Type      | From (API gateway log group)                                                                                                                                                   |
+| ---------------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `apigw.requests{app=<app>,class=2xx\|3xx\|4xx\|5xx}`       | counter   | Access log lines (`type = "app-requests-received"`, not "request aborted") by `statusCode`                                                                                     |
+| `apigw.status401{app=<app>}`, `apigw.status429{app=<app>}` | counter   | Same lines with status 401 or 429                                                                                                                                              |
+| `apigw.responseTime{app=<app>}`                            | histogram | Same lines, `responseTime`                                                                                                                                                     |
+| `login.failed{method=sfi\|ad\|weak\|passkey}`              | counter   | Audit `evaka.saml.suomifi.sign_in_failed` (citizen and employee), `evaka.saml.ead.sign_in_failed`, `evaka.citizen_weak.sign_in_failed`, `evaka.citizen_passkey.sign_in_failed` |
+| `login.rateLimited`                                        | counter   | "Login request hit rate limit"                                                                                                                                                 |
+
+| Series                                     | Type    | From (proxy log group)                                                    |
+| ------------------------------------------ | ------- | ------------------------------------------------------------------------- |
+| `proxy.requests{class=2xx\|3xx\|4xx\|5xx}` | counter | nginx access log lines (`type = "app-requests-received"`) by `statusCode` |
+| `proxy.status502`, `proxy.status504`       | counter | Same lines with status 502 or 504                                         |
+
 ## Collector
 
 A bucket is closed when its end is at least `ingestion_delay_seconds` (by
@@ -111,11 +130,19 @@ The collector keeps a watermark for each source in `state/collector.json`: the
 end of the last bucket that it stored.
 
 ```json
-{ "service": "2026-10-06T12:00:00Z", "metrics": "2026-10-06T12:00:00Z" }
+{
+  "service": "2026-10-06T12:00:00Z",
+  "apigw": "2026-10-06T12:00:00Z",
+  "proxy": "2026-10-06T12:00:00Z",
+  "metrics": "2026-10-06T12:00:00Z"
+}
 ```
 
+The sources are the log groups `service`, `apigw` and `proxy`, and `metrics`.
+A log group without a name in the inputs has no source.
+
 - Each run makes at most one Logs Insights query or `GetMetricData` call for
-  each source.
+  each source. A query counts every series of its log group.
 - Logs: each run queries Logs Insights from the watermark to the latest closed
   bucket, so each log line is scanned only once. When no bucket closed since
   the last run, there is no query. The first run, with no watermark, processes
@@ -127,13 +154,13 @@ end of the last bucket that it stored.
   fails keeps its watermark, so the next run retries it, and the other sources
   continue.
 - After an outage, the next runs fill the missed buckets automatically: each
-  run covers up to 12 hours of the service log group and 1 day of metrics. The
-  12 hours keep a query result under 10,000 rows, the most that one
-  `GetQueryResults` call returns. A result that reaches 10,000 rows is queried
-  again in two halves, down to one bucket; a bucket that still reaches it fails
-  the source, and nothing is stored for the range. A run stops before a source
-  when less than 60 s of the 300 s timeout is left. Later runs continue from the
-  watermark.
+  run covers up to 12 hours of the service and API gateway log groups, and 1
+  day of the proxy log group and the metrics. These ranges keep a query result
+  under 10,000 rows, the most that one `GetQueryResults` call returns. A result
+  that reaches 10,000 rows is queried again in two halves, down to one bucket;
+  a bucket that still reaches it fails the source, and nothing is stored for
+  the range. A run stops before a source when less than 60 s of the 300 s
+  timeout is left. Later runs continue from the watermark.
 
 Writing a slot again gives the same result. A scheduled run fails without a
 query when `state/collector.json` is not a JSON object, or has a watermark that
@@ -210,6 +237,8 @@ module "ops_metrics" {
   name_prefix             = "evaka-${var.environment}"
   account_id              = var.account_id
   service_log_group_name  = "evaka-srv-${var.environment}"
+  apigw_log_group_name    = "evaka-apigw-${var.environment}"
+  proxy_log_group_name    = "evaka-proxy-${var.environment}"
   rds_instance_identifier = "evaka-${var.environment}"
   token_ssm_name          = aws_ssm_parameter.ops_metrics_token.name
   bucket_kms_arn          = aws_kms_key.logs.arn
@@ -250,7 +279,9 @@ response has one URL, for 2026-10-05. Without the header, the response is 401.
 | ------------------------- | -------------- | -------- | ----------------------- | --------------------------------------------------------------------------------------------- |
 | `name_prefix`             | `string`       | yes      |                         | Prefix for the bucket, the Lambdas, their roles and the schedule. Example: `"evaka-staging"`. |
 | `account_id`              | `string`       | yes      |                         | AWS account ID, used for IAM resource ARNs.                                                   |
-| `service_log_group_name`  | `string`       | yes      |                         | Log group of the eVaka service, for the audit events.                                         |
+| `service_log_group_name`  | `string`       | yes      |                         | Log group of the eVaka service.                                                               |
+| `apigw_log_group_name`    | `string`       | no       | `null`                  | Log group of the eVaka API gateway. Null leaves out its series.                               |
+| `proxy_log_group_name`    | `string`       | no       | `null`                  | Log group of the eVaka nginx proxy. Null leaves out its series.                               |
 | `rds_instance_identifier` | `string`       | yes      |                         | `DBInstanceIdentifier` of the eVaka database.                                                 |
 | `token_ssm_name`          | `string`       | yes      |                         | Name of the SecureString SSM parameter that holds the bearer token.                           |
 | `token_kms_arn`           | `string`       | no       | `""`                    | KMS key ARN of the token parameter. Leave empty if it uses `aws/ssm`.                         |

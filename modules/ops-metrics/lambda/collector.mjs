@@ -17,9 +17,17 @@ import {
 import { queryBuckets } from './insights.mjs'
 import { getMetricSummaries } from './metrics.mjs'
 import {
+  APIGW_MAX_RANGE_MS,
+  APIGW_QUERY,
+  APIGW_SERIES,
+  PROXY_MAX_RANGE_MS,
+  PROXY_QUERY,
+  PROXY_SERIES,
   SERVICE_MAX_RANGE_MS,
   SERVICE_QUERY,
   SERVICE_SERIES,
+  apigwValuesFromRows,
+  proxyValuesFromRows,
   serviceValuesFromRows
 } from './queries.mjs'
 
@@ -37,6 +45,8 @@ function config() {
   return {
     bucket: process.env.BUCKET,
     serviceLogGroupName: process.env.SERVICE_LOG_GROUP_NAME,
+    apigwLogGroupName: process.env.APIGW_LOG_GROUP_NAME || null,
+    proxyLogGroupName: process.env.PROXY_LOG_GROUP_NAME || null,
     rdsInstanceIdentifier: process.env.RDS_INSTANCE_IDENTIFIER,
     ingestionDelayMs:
       parseInt(process.env.INGESTION_DELAY_SECONDS ?? '300', 10) * 1000
@@ -97,25 +107,57 @@ export function summariesToValues(summaries, seriesName, fromMs, toMs) {
   return values
 }
 
+function logSource(
+  name,
+  logGroupName,
+  maxRangeMs,
+  queryString,
+  series,
+  toValues
+) {
+  return {
+    name,
+    lookbackMs: 0,
+    maxRangeMs,
+    series,
+    async collect(fromMs, toMs) {
+      const rows = await queryBuckets([logGroupName], queryString, fromMs, toMs)
+      return toValues(rows, fromMs, toMs)
+    }
+  }
+}
+
 // The name of a source is also its key in the state file. maxRangeMs is the
-// longest range of one query or GetMetricData call.
+// longest range of one query or GetMetricData call. A log group without a
+// name has no source.
 function sources(cfg) {
   return [
-    {
-      name: 'service',
-      lookbackMs: 0,
-      maxRangeMs: SERVICE_MAX_RANGE_MS,
-      series: SERVICE_SERIES,
-      async collect(fromMs, toMs) {
-        const rows = await queryBuckets(
-          [cfg.serviceLogGroupName],
-          SERVICE_QUERY,
-          fromMs,
-          toMs
-        )
-        return serviceValuesFromRows(rows, fromMs, toMs)
-      }
-    },
+    logSource(
+      'service',
+      cfg.serviceLogGroupName,
+      SERVICE_MAX_RANGE_MS,
+      SERVICE_QUERY,
+      SERVICE_SERIES,
+      serviceValuesFromRows
+    ),
+    cfg.apigwLogGroupName &&
+      logSource(
+        'apigw',
+        cfg.apigwLogGroupName,
+        APIGW_MAX_RANGE_MS,
+        APIGW_QUERY,
+        APIGW_SERIES,
+        apigwValuesFromRows
+      ),
+    cfg.proxyLogGroupName &&
+      logSource(
+        'proxy',
+        cfg.proxyLogGroupName,
+        PROXY_MAX_RANGE_MS,
+        PROXY_QUERY,
+        PROXY_SERIES,
+        proxyValuesFromRows
+      ),
     {
       name: 'metrics',
       lookbackMs: METRICS_LOOKBACK_MS,
@@ -130,7 +172,7 @@ function sources(cfg) {
         return summariesToValues(summaries, 'rds.cpu', fromMs, toMs)
       }
     }
-  ]
+  ].filter(Boolean)
 }
 
 export function mergeValues(valueMaps) {
