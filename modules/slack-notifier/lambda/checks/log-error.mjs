@@ -67,15 +67,34 @@ export const EVAKA_PRESET = {
   traceId: 'traceId'
 }
 
-// nginx logs plain text, so no field holds the level: the severity is the
-// "[error]" tag nginx writes into the line. Matching that tag rather than the
-// word "error" keeps out access-log lines for requests that merely mention it.
+// A plain-text log has no field to filter on, so a text preset carries the
+// regex that recognises an error line instead of field names. Each matches where
+// its logger puts the level, never the bare word, so a request path or a stack
+// frame that happens to contain it does not count as an error.
+
+// nginx writes the severity as a bracketed tag, and its access-log lines sit in
+// the same stream.
 export const NGINX_PRESET = {
   text: true,
-  severities: ['emerg', 'alert', 'crit', 'error']
+  pattern: '\\[(emerg|alert|crit|error)\\]'
 }
 
-const PRESETS = { ...FORMAT_PRESETS, evaka: EVAKA_PRESET, nginx: NGINX_PRESET }
+// A Django service's log group carries two shapes, because gunicorn's master
+// process and Django's own logging config both write to stdout: "[ERROR]" from
+// gunicorn (worker kills, binding failures) and "<logger> ERROR: <message>"
+// from Django (request failures). Reading only one of them hides a whole class
+// of failure while the source looks healthy.
+export const DJANGO_PRESET = {
+  text: true,
+  pattern: '(\\[(ERROR|CRITICAL)\\]| (ERROR|CRITICAL): )'
+}
+
+const PRESETS = {
+  ...FORMAT_PRESETS,
+  evaka: EVAKA_PRESET,
+  nginx: NGINX_PRESET,
+  django: DJANGO_PRESET
+}
 
 const EVAKA_NOISE_FILTERS = [
   'filter not (loggerName like /^evaka\\.core\\.shared\\.async\\.AsyncJobPool\\./ and meta.remainingAttempts > 0)',
@@ -95,7 +114,7 @@ export function buildQueryParts(
     ? `coalesce(${preset.level}, ${preset.fallbackLevel})`
     : preset.level
   const parts = preset.text
-    ? [`filter @message like /\\[(${preset.severities.join('|')})\\]/`]
+    ? [`filter @message like /${preset.pattern}/`]
     : [`filter tolower(${level}) = "error"`]
   if (throwSitePackagePrefix && preset.asyncJobPoolLogger) {
     const loggerPrefix = escapeRegExp(
@@ -328,6 +347,6 @@ async function run(sourceName, source, logGroupNames, partition) {
 
 export default {
   name: 'log-error',
-  formats: ['logback-json', 'pino-json', 'evaka', 'nginx'],
+  formats: ['logback-json', 'pino-json', 'evaka', 'nginx', 'django'],
   run
 }

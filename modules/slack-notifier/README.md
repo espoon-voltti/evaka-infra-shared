@@ -106,12 +106,14 @@ log_sources = {
   logger setup (`messageKey: 'message'`, a string `level` label, `appName` in
   the logger's base fields); its error entries carry no request context, so
   their Slack lines and the `endpoint` column show the logger name rather than
-  a `METHOD /path`. `"nginx"` reads plain-text nginx logs, which have no level
-  field at all: it matches the severity tag nginx writes into the line
-  (`[emerg]`, `[alert]`, `[crit]`, `[error]`) and reports the line as it
-  stands. Matching the tag rather than the word "error" keeps out access-log
-  lines for requests that merely contain it. `"evaka-audit"` does not look for
-  errors at all: it reports the audit entries a source names, see
+  a `METHOD /path`. `"nginx"` and `"django"` read plain text, which has no level
+  field at all: each matches where its logger puts the level and reports the line
+  as it stands. `"nginx"` matches the severity tag (`[emerg]`, `[alert]`,
+  `[crit]`, `[error]`), which keeps out access-log lines for requests that merely
+  contain the word. `"django"` matches both shapes a Django container writes to
+  one stream: gunicorn's `[ERROR]`/`[CRITICAL]` and Django's own
+  `<logger> ERROR:`/`CRITICAL:`. `"evaka-audit"` does not look for errors at all:
+  it reports the audit entries a source names, see
   [Audit event watching](#audit-event-watching-evaka-audit).
 - `log_group_name_prefixes` grants `logs:StartQuery` on a prefix-wildcarded ARN
   and has the lambda resolve actual log group names via `DescribeLogGroups` at

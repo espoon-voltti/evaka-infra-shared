@@ -85,8 +85,8 @@ variable "log_sources" {
   default = {}
 
   validation {
-    condition     = alltrue([for s in var.log_sources : contains(["logback-json", "pino-json", "nginx", "ssm-session-audit", "evaka-audit"], s.format)])
-    error_message = "log_sources[*].format must be \"logback-json\", \"pino-json\", \"nginx\", \"ssm-session-audit\" or \"evaka-audit\"."
+    condition     = alltrue([for s in var.log_sources : contains(["logback-json", "pino-json", "nginx", "django", "ssm-session-audit", "evaka-audit"], s.format)])
+    error_message = "log_sources[*].format must be \"logback-json\", \"pino-json\", \"nginx\", \"django\", \"ssm-session-audit\" or \"evaka-audit\"."
   }
 
   validation {

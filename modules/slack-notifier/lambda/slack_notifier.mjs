@@ -162,7 +162,8 @@ export {
   formatErrorCount,
   FORMAT_PRESETS,
   EVAKA_PRESET,
-  NGINX_PRESET
+  NGINX_PRESET,
+  DJANGO_PRESET
 } from './checks/log-error.mjs'
 export { buildSessionDigestPayload } from './checks/session-audit.mjs'
 export {

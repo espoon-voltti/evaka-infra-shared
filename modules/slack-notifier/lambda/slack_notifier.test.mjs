@@ -23,6 +23,7 @@ const {
   FORMAT_PRESETS,
   EVAKA_PRESET,
   NGINX_PRESET,
+  DJANGO_PRESET,
   buildQueryParts,
   buildInsightsFields,
   discoverLogGroupNames,
@@ -175,6 +176,21 @@ describe('buildQueryParts', () => {
     )
     assert.equal(
       buildInsightsFields(NGINX_PRESET),
+      'fields @timestamp, @message'
+    )
+  })
+
+  // gunicorn and Django write the level in different places into the same
+  // stream, and a pattern that caught only one of them would report request
+  // failures while missing worker kills, or the reverse.
+  it('filters Django logs on both the gunicorn and the Django level position', () => {
+    const parts = buildQueryParts(DJANGO_PRESET, '', [])
+    assert.equal(
+      parts[0],
+      'filter @message like /(\\[(ERROR|CRITICAL)\\]| (ERROR|CRITICAL): )/'
+    )
+    assert.equal(
+      buildInsightsFields(DJANGO_PRESET),
       'fields @timestamp, @message'
     )
   })
@@ -1384,6 +1400,53 @@ describe('handleLogSourceCheck', () => {
     const blocks = posted[0].attachments[0].blocks
     assert.match(blocks[0].text.text, /\[example-prod\/frontend\] 1 error\(s\)/)
     assert.ok(blocks[1].text.text.includes('directory index of'))
+  })
+
+  // Both Django shapes in one window, from a log group that does not follow the
+  // /aws/ecs/<app-env>/<component> convention, so the label falls back to the
+  // source name alone.
+  it('reports both gunicorn and Django plain-text lines', async () => {
+    const { handleLogSourceCheck } = await freshModule()
+    const gunicornLine =
+      '[2026-09-24 18:00:41 +0300] [1] [ERROR] Worker (pid:602) was sent SIGKILL! Perhaps out of memory?'
+    const djangoLine =
+      '2026-09-27 04:01:35,509 django.request ERROR: Internal Server Error: /api/events/v1/event/example:abc123/'
+    cloudwatchLogsStub.getQueryResultsResponses = [
+      {
+        status: 'Complete',
+        results: [
+          [
+            { field: '@timestamp', value: '2026-09-24 15:00:41.000' },
+            { field: '@message', value: gunicornLine }
+          ],
+          [
+            { field: '@timestamp', value: '2026-09-27 01:01:35.509' },
+            { field: '@message', value: djangoLine }
+          ]
+        ],
+        statistics: { recordsMatched: 2 }
+      }
+    ]
+
+    await handleLogSourceCheck(
+      'service',
+      {
+        log_group_names: ['example-service-prod'],
+        log_group_name_prefixes: [],
+        format: 'django',
+        throw_site_package_prefix: '',
+        extra_noise_filters: [],
+        channel: '#example-alerts'
+      },
+      'aws'
+    )
+
+    assert.equal(posted.length, 1)
+    assert.equal(posted[0].channel, '#example-alerts')
+    const blocks = posted[0].attachments[0].blocks
+    assert.match(blocks[0].text.text, /\[service\] 2 error\(s\)/)
+    assert.ok(blocks[1].text.text.includes('was sent SIGKILL'))
+    assert.ok(blocks[2].text.text.includes('Internal Server Error'))
   })
 
   it('warns on Slack when the query never completes', async () => {
