@@ -5,7 +5,9 @@
   "scripts": {
     "prettier": "prettier --write .",
     "lint:prettier": "prettier --check .",
-    "test": "node --loader ./modules/slack-notifier/lambda/mock-aws-loader.mjs --test"
+    "test": "npm run test:slack-notifier && npm run test:ops-metrics",
+    "test:slack-notifier": "node --loader ./modules/slack-notifier/lambda/mock-aws-loader.mjs --test 'modules/slack-notifier/**/*.test.mjs'",
+    "test:ops-metrics": "node --loader ./modules/ops-metrics/lambda/mock-aws-loader.mjs --test 'modules/ops-metrics/**/*.test.mjs'"
   },
   "private": true,
   "license": "LGPL-2.1-or-later",
