@@ -127,7 +127,9 @@ data "archive_file" "slack_notifier" {
 }
 
 resource "aws_iam_role" "slack_notifier" {
-  name = "${var.name_prefix}-slack-notifier"
+  name                 = "${var.name_prefix}-slack-notifier"
+  path                 = var.iam_role_path
+  permissions_boundary = var.permissions_boundary
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"

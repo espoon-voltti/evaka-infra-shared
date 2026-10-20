@@ -150,3 +150,15 @@ variable "alarm_reminder_schedule_expression" {
   type        = string
   default     = "cron(0 5 * * ? *)"
 }
+
+variable "permissions_boundary" {
+  description = "ARN of a permissions boundary policy to attach to the lambda's IAM role. Needed where the applying principal is itself under a boundary that denies iam:CreateRole unless the new role carries the same boundary."
+  type        = string
+  default     = null
+}
+
+variable "iam_role_path" {
+  description = "Path of the lambda's IAM role. Changing it on an existing deployment replaces the role. Some accounts only let the applying principal create and pass roles under a given path, such as \"/workload/\"."
+  type        = string
+  default     = "/"
+}
