@@ -224,11 +224,13 @@ resource "aws_lambda_permission" "log_subscription" {
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.slack_notifier.function_name
   principal     = "logs.amazonaws.com"
-  # The region is taken from the function's ARN: aws_region's attribute for it
-  # differs between the 5.x and 6.x providers this module accepts.
+  # Partition and region must come from the function's ARN, which stays known
+  # while the function is updated in place. A data source goes unknown whenever
+  # a caller's depends_on defers this module's reads, and the replacement that
+  # forces leaves log deliveries unauthorized until it completes.
   source_arn = format(
     "arn:%s:logs:%s:%s:log-group:%s:*",
-    data.aws_partition.current.partition,
+    split(":", aws_lambda_function.slack_notifier.arn)[1],
     split(":", aws_lambda_function.slack_notifier.arn)[3],
     var.account_id,
     each.value.log_group_name,
