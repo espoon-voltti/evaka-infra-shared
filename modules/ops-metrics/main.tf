@@ -7,6 +7,13 @@ locals {
 
   bucket_objects_arn = "${aws_s3_bucket.ops_metrics.arn}/*"
 
+  # From 2027-04-26 CloudWatch Logs authorizes log-group actions (CreateLogGroup,
+  # StartQuery) only against the log group's own ARN, while `<log group ARN>:*`
+  # covers its log streams, so every log grant below matches both.
+  log_group_arn_prefix    = "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:"
+  collector_log_group_arn = "${local.log_group_arn_prefix}/aws/lambda/${local.collector_function_name}"
+  reader_log_group_arn    = "${local.log_group_arn_prefix}/aws/lambda/${local.reader_function_name}"
+
   insights_log_group_names = [
     for name in [var.service_log_group_name, var.apigw_log_group_name, var.proxy_log_group_name] : name if name != null
   ]
@@ -25,12 +32,12 @@ locals {
       {
         Effect   = "Allow"
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:/aws/lambda/${local.collector_function_name}:*"
+        Resource = [local.collector_log_group_arn, "${local.collector_log_group_arn}:*"]
       },
       {
         Effect   = "Allow"
         Action   = ["logs:StartQuery"]
-        Resource = [for name in local.insights_log_group_names : "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:${name}:*"]
+        Resource = flatten([for name in local.insights_log_group_names : ["${local.log_group_arn_prefix}${name}", "${local.log_group_arn_prefix}${name}:*"]])
       },
       {
         Effect   = "Allow"
@@ -61,7 +68,7 @@ locals {
       {
         Effect   = "Allow"
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:/aws/lambda/${local.reader_function_name}:*"
+        Resource = [local.reader_log_group_arn, "${local.reader_log_group_arn}:*"]
       },
       {
         Effect   = "Allow"

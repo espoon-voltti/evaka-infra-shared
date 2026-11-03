@@ -15,11 +15,17 @@ locals {
   log_source_prefixes    = distinct(flatten([for s in var.log_sources : s.log_group_name_prefixes]))
   log_source_exact_names = distinct(flatten([for s in var.log_sources : s.log_group_names]))
 
+  # From 2027-04-26 CloudWatch Logs authorizes log-group actions (CreateLogGroup,
+  # StartQuery) only against the log group's own ARN, while `<log group ARN>:*`
+  # covers its log streams, so every log grant below matches both.
+  log_group_arn_prefix = "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:"
+  lambda_log_group_arn = "${local.log_group_arn_prefix}/aws/lambda/${local.function_name}"
+
   base_iam_statements = [
     {
       Effect   = "Allow"
       Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-      Resource = "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:/aws/lambda/${local.function_name}:*"
+      Resource = [local.lambda_log_group_arn, "${local.lambda_log_group_arn}:*"]
     },
     {
       Effect   = "Allow"
@@ -37,14 +43,14 @@ locals {
     length(var.log_group_names) > 0 ? [{
       Effect   = "Allow"
       Action   = ["logs:StartQuery"]
-      Resource = [for n in var.log_group_names : "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:${n}:*"]
+      Resource = flatten([for n in var.log_group_names : ["${local.log_group_arn_prefix}${n}", "${local.log_group_arn_prefix}${n}:*"]])
     }] : [],
     length(local.log_source_exact_names) > 0 || length(local.log_source_prefixes) > 0 ? [{
       Effect = "Allow"
       Action = ["logs:StartQuery"]
       Resource = concat(
-        [for n in local.log_source_exact_names : "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:${n}:*"],
-        [for p in local.log_source_prefixes : "arn:${data.aws_partition.current.partition}:logs:*:${var.account_id}:log-group:${p}*:*"],
+        flatten([for n in local.log_source_exact_names : ["${local.log_group_arn_prefix}${n}", "${local.log_group_arn_prefix}${n}:*"]]),
+        [for p in local.log_source_prefixes : "${local.log_group_arn_prefix}${p}*"],
       )
     }] : [],
     # DescribeLogGroups cannot be scoped to log groups by name: being a list
