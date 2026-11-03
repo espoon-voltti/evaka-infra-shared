@@ -106,6 +106,18 @@ locals {
   } : {}
 
   metric_alarms = merge(local.backup_failed_alarm, var.metric_alarms)
+
+  # The lambda finds a delivered batch's settings by the filter name the batch
+  # carries, so these keys must be the subscription filters' names.
+  log_subscriptions = {
+    for key, subscription in var.log_subscriptions : "${local.function_name}-${key}" => {
+      log_group_name = subscription.log_group_name
+      filter_pattern = subscription.filter_pattern
+      format         = subscription.format
+      account_names  = subscription.account_names
+      channel        = subscription.channel
+    }
+  }
 }
 
 # The lambda is split into an entry point, shared lib, and one file per check /
@@ -165,7 +177,7 @@ resource "aws_iam_role_policy" "slack_notifier" {
 #tfsec:ignore:aws-lambda-enable-tracing
 resource "aws_lambda_function" "slack_notifier" {
   function_name    = local.function_name
-  description      = "Forwards CloudWatch alarms and log errors to Slack"
+  description      = "Forwards CloudWatch alarms, log errors and log events to Slack"
   role             = aws_iam_role.slack_notifier.arn
   handler          = "slack_notifier.handler"
   runtime          = "nodejs24.x"
@@ -181,6 +193,7 @@ resource "aws_lambda_function" "slack_notifier" {
       LOG_GROUP_NAMES        = join(",", var.log_group_names)
       LOG_QUERY_SECONDS      = tostring(var.log_query_seconds)
       LOG_SOURCES_JSON       = jsonencode(var.log_sources)
+      LOG_SUBSCRIPTIONS_JSON = jsonencode({ for name, s in local.log_subscriptions : name => { format = s.format, account_names = s.account_names, channel = s.channel } })
       ALARM_SNS_TOPIC_ARN    = var.alarm_sns_topic_arn != null ? var.alarm_sns_topic_arn : ""
     }
   }
@@ -201,6 +214,36 @@ resource "aws_lambda_permission" "sns_invoke" {
   function_name = aws_lambda_function.slack_notifier.function_name
   principal     = "sns.amazonaws.com"
   source_arn    = var.alarm_sns_topic_arn
+}
+
+# Log subscriptions: log group -> lambda, per event batch.
+resource "aws_lambda_permission" "log_subscription" {
+  for_each = local.log_subscriptions
+
+  statement_id  = "AllowLogsInvoke-${each.key}"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.slack_notifier.function_name
+  principal     = "logs.amazonaws.com"
+  # The region is taken from the function's ARN: aws_region's attribute for it
+  # differs between the 5.x and 6.x providers this module accepts.
+  source_arn = format(
+    "arn:%s:logs:%s:%s:log-group:%s:*",
+    data.aws_partition.current.partition,
+    split(":", aws_lambda_function.slack_notifier.arn)[3],
+    var.account_id,
+    each.value.log_group_name,
+  )
+}
+
+resource "aws_cloudwatch_log_subscription_filter" "log_subscription" {
+  for_each = local.log_subscriptions
+
+  name            = each.key
+  log_group_name  = each.value.log_group_name
+  filter_pattern  = each.value.filter_pattern
+  destination_arn = aws_lambda_function.slack_notifier.arn
+
+  depends_on = [aws_lambda_permission.log_subscription]
 }
 
 # Metric alarms -> SNS topic -> lambda -> Slack.

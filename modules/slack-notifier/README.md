@@ -197,6 +197,45 @@ log_sources = {
   indexing delay in the past), and an entry near a window boundary can be
   reported twice.
 
+### Log subscriptions (`log_subscriptions`)
+
+A scheduled scan queries a fixed window of event time, so an entry that reaches
+CloudWatch Logs after its window has been queried is never seen. That is fine
+for application errors and not for security events, which CloudTrail delivers
+5–15 minutes late. `log_subscriptions` instead attaches a CloudWatch Logs
+subscription filter to a log group, and the group pushes each batch of events
+to the lambda as it arrives:
+
+```hcl
+log_subscriptions = {
+  cloudtrail = {
+    log_group_name = "aws-controltower/CloudTrailLogs-abc-def"
+    format         = "cloudtrail"
+    account_names  = { "111111111111" = "example-dev" }
+    channel        = "#security"
+  }
+}
+```
+
+The filter is named `<name_prefix>-slack-notifier-<key>`. A log group takes at
+most two subscription filters, counting any another service already has on it.
+
+`"cloudtrail"` is for an organization trail's CloudWatch Logs copy. Every event
+is delivered (`filter_pattern = ""`) and matched against the rule table in
+`lambda/subscriptions/cloudtrail.mjs`: root use, console sign-in without MFA,
+IAM users and access keys created (SCP-denied attempts included),
+`AdministratorAccess` attached, CloudTrail, GuardDuty, Security Hub or Config
+turned off or detached from the organization, KMS key deletion, and
+Organizations and Identity Center changes. Each batch with a match posts one
+message, with one line per rule, account and principal (the role session name
+and permission set of an Identity Center user), the event names with counts,
+any error codes, and a Logs Insights link to the batch's events. Request
+parameters, source addresses and user agents are left out of Slack.
+
+A failed post fails the invocation, so Lambda retries it twice; after that the
+events are only in the log group. Watch the lambda's `Errors` metric to know
+when that happened.
+
 ### Alarm reminder
 
 Once a day the lambda calls `DescribeAlarms` and posts one message listing
@@ -250,6 +289,7 @@ account-level (empty-dimension) metric does not report data.
 | `slack_webhook_kms_arn`              | `string`       | no       | `""`                | KMS key ARN. Leave empty if the SSM parameter is encrypted with `aws/ssm`.                                                                                                                                                                                         |
 | `log_group_names`                    | `list(string)` | no       | `[]`                | CloudWatch log groups to scan and to use for trace-id deep-links. Empty turns the scheduled scan off entirely (no schedule, no Insights grants), leaving an alarm-forwarder-only deployment. The query is eVaka-specific, so other consumers normally want it off. |
 | `log_sources`                        | `map(object)`  | no       | `{}`                | Additional, per-source log scans for other applications' field-name conventions. See [Generalized log scanning](#generalized-log-scanning-log_sources).                                                                                                            |
+| `log_subscriptions`                  | `map(object)`  | no       | `{}`                | Subscription filters pushing a log group's events to the lambda as they arrive. See [Log subscriptions](#log-subscriptions-log_subscriptions).                                                                                                                     |
 | `log_query_seconds`                  | `number`       | no       | `300`               | Sliding window for the log-error scan (`log_group_names` and every `log_sources` entry). The 5-minute schedule is hardcoded and assumes this cadence.                                                                                                              |
 | `metric_alarms`                      | `map(object)`  | no       | `{}`                | CloudWatch metric alarms to create, keyed by alarm-name suffix. Routed to `alarm_sns_topic_arn`. Per-alarm `notify_on_ok` (default `true`) controls whether the green "recovered" message is sent. See variable for fields/defaults.                               |
 | `backup_failed_alarm_enabled`        | `bool`         | no       | `true`              | Create a built-in `backup-failed` alarm (AWS/Backup `NumberOfBackupJobsFailed`, Sum over 1h > 0). On by default; auto-skipped when `alarm_sns_topic_arn` is null. Set `false` to opt out.                                                                          |

@@ -100,6 +100,39 @@ variable "log_sources" {
   }
 }
 
+variable "log_subscriptions" {
+  description = <<-EOT
+    CloudWatch Logs subscription filters delivering a log group's events to the
+    lambda as they arrive, keyed by a short name that becomes the filter name's
+    suffix. Unlike a log_sources scan, nothing is missed for arriving late, and
+    every matching event is reported rather than one per alarm state change.
+
+    format selects the handler: "cloudtrail" reads an organization trail's
+    CloudWatch Logs copy and reports the security-relevant events in the
+    lambda's rule table (lambda/subscriptions/cloudtrail.mjs). filter_pattern
+    narrows what is delivered; the default delivers every event and leaves the
+    matching to the handler. account_names (account id => name) names accounts
+    in the messages; an account missing from it is shown by id. channel
+    overrides the account's Slack channel for this subscription alone.
+
+    A log group takes at most two subscription filters, counting any it already
+    has.
+  EOT
+  type = map(object({
+    log_group_name = string
+    format         = string
+    filter_pattern = optional(string, "")
+    account_names  = optional(map(string), {})
+    channel        = optional(string)
+  }))
+  default = {}
+
+  validation {
+    condition     = alltrue([for s in var.log_subscriptions : contains(["cloudtrail"], s.format)])
+    error_message = "log_subscriptions[*].format must be \"cloudtrail\"."
+  }
+}
+
 variable "log_query_seconds" {
   description = "Sliding window length for the log-error scan (seconds). The 5-minute EventBridge schedule is hardcoded; the lambda's overlap and CloudWatch-indexing-delay constants assume that cadence."
   type        = number
