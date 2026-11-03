@@ -116,6 +116,8 @@ data "archive_file" "slack_notifier" {
   type        = "zip"
   source_dir  = "${path.module}/lambda"
   output_path = "${path.module}/slack_notifier.zip"
+  # Fixed mode so the zip hash is identical on Windows and Unix
+  output_file_mode = "0644"
   excludes = [
     "slack_notifier.test.mjs",
     "stub-ssm.mjs",
