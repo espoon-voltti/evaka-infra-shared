@@ -1,7 +1,5 @@
 // Log subscription handler: CloudTrail records, as an organization trail delivers
 // them to CloudWatch Logs, matched against RULES and posted one message per batch.
-// Every event that matches is reported, unlike a metric alarm, which posts once
-// on entering ALARM and stays quiet about further events until it has cleared.
 
 import {
   REGION,
