@@ -5,7 +5,11 @@
 //   - checks/   : scheduled checks. Logs Insights scans are dispatched by a
 //                 source's `format`; the alarm reminder by the event's `action`,
 //                 which is also what a manual invocation sends.
+//   - subscriptions/ : batches a CloudWatch Logs subscription filter delivers,
+//                 dispatched by the subscription's `format`.
 // Adding an alert is a new file plus one import line below, not a branch here.
+
+import { gunzipSync } from 'node:zlib'
 
 import {
   REGION,
@@ -21,6 +25,7 @@ import auditEvent from './checks/audit-event.mjs'
 import alarmReminder from './checks/alarm-reminder.mjs'
 import alarm from './messages/alarm.mjs'
 import notification from './messages/notification.mjs'
+import cloudtrail from './subscriptions/cloudtrail.mjs'
 
 // Order matters: notification.matches() is the catch-all, so it stays last.
 const MESSAGES = [alarm, notification]
@@ -35,11 +40,20 @@ const LOG_GROUP_NAMES = (process.env.LOG_GROUP_NAMES ?? '')
   .filter(Boolean)
 const LOG_SOURCES = JSON.parse(process.env.LOG_SOURCES_JSON ?? '{}')
 
+const SUBSCRIPTION_HANDLERS = [cloudtrail]
+const subscriptionHandlerByFormat = Object.fromEntries(
+  SUBSCRIPTION_HANDLERS.flatMap((h) => h.formats.map((format) => [format, h]))
+)
+// Keyed by subscription filter name, which each delivered batch names.
+const LOG_SUBSCRIPTIONS = JSON.parse(process.env.LOG_SUBSCRIPTIONS_JSON ?? '{}')
+
 export async function handler(event, context) {
   const partition = context.invokedFunctionArn.split(':')[1]
 
   if (event.action === alarmReminder.action) {
     return runReminder(partition)
+  } else if ('awslogs' in event) {
+    await handleLogSubscription(event, partition)
   } else if ('Records' in event) {
     for (const record of event.Records) {
       try {
@@ -85,6 +99,29 @@ async function handleSnsRecord(record, partition) {
     { region: REGION, partition }
   )
   await postToSlack(payload)
+}
+
+export function decodeLogSubscriptionEvent(event) {
+  return JSON.parse(
+    gunzipSync(Buffer.from(event.awslogs.data, 'base64')).toString('utf8')
+  )
+}
+
+async function handleLogSubscription(event, partition) {
+  const batch = decodeLogSubscriptionEvent(event)
+  // Sent once when a subscription filter is created, to check the destination.
+  if (batch.messageType === 'CONTROL_MESSAGE') return
+
+  const filterName = batch.subscriptionFilters?.[0]
+  const subscription = LOG_SUBSCRIPTIONS[filterName]
+  const handler = subscriptionHandlerByFormat[subscription?.format]
+  if (!handler) {
+    console.warn(
+      `No handler for subscription filter "${filterName}" on ${batch.logGroup}, skipping`
+    )
+    return
+  }
+  await handler.handle(batch, subscription, partition)
 }
 
 // The eVaka LOG_GROUP_NAMES scan is a log-error check with the eVaka preset,
@@ -160,7 +197,12 @@ async function runScan(label, scan) {
   }
 }
 
-export { handleSnsRecord, handleLogCheck, handleLogSourceCheck }
+export {
+  handleSnsRecord,
+  handleLogCheck,
+  handleLogSourceCheck,
+  handleLogSubscription
+}
 
 // Public surface, re-exported from the modules that own each piece so callers
 // (and the tests) have one import point.
@@ -198,4 +240,12 @@ export {
   buildAuditEventPayload
 } from './checks/audit-event.mjs'
 export { buildAlarmPayload } from './messages/alarm.mjs'
+export {
+  RULES as CLOUDTRAIL_RULES,
+  matchRule,
+  formatPrincipal,
+  groupMatches,
+  buildEventsQuery,
+  buildCloudTrailPayload
+} from './subscriptions/cloudtrail.mjs'
 export { buildNotificationPayload } from './messages/notification.mjs'

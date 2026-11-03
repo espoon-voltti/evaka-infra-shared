@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { gzipSync } from 'node:zlib'
 
 import { ssmStub } from './stub-ssm.mjs'
 import { cloudwatchLogsStub } from './stub-cloudwatch-logs.mjs'
@@ -15,6 +16,12 @@ const {
   buildLogInsightsUrl,
   buildAlarmPayload,
   buildNotificationPayload,
+  CLOUDTRAIL_RULES,
+  matchRule,
+  formatPrincipal,
+  groupMatches,
+  buildEventsQuery,
+  buildCloudTrailPayload,
   buildSessionDigestPayload,
   buildAlarmReminderPayload,
   listActiveAlarms,
@@ -2011,5 +2018,497 @@ describe('handler on an alarm-reminder event', () => {
     assert.deepEqual(result, { alarmCount: 0, posted: false })
     assert.equal(cloudwatchStub.calls.length, 0)
     assert.equal(posted.length, 0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// CloudTrail subscription
+// ---------------------------------------------------------------------------
+const SSO_ADMIN = {
+  type: 'AssumedRole',
+  arn: 'arn:aws-eusc:sts::111111111111:assumed-role/AWSReservedSSO_AdministratorAccess_0123456789abcdef/someone@example.com',
+  accountId: '111111111111'
+}
+
+function trailRecord(overrides) {
+  return {
+    eventVersion: '1.11',
+    userIdentity: SSO_ADMIN,
+    eventSource: 'iam.amazonaws.com',
+    eventName: 'ListUsers',
+    recipientAccountId: '111111111111',
+    eventID: 'id-1',
+    ...overrides
+  }
+}
+
+describe('matchRule', () => {
+  const cases = [
+    [
+      'root console sign-in',
+      {
+        userIdentity: { type: 'Root', arn: 'arn:aws:iam::111111111111:root' },
+        eventName: 'ConsoleLogin',
+        eventSource: 'signin.amazonaws.com',
+        eventType: 'AwsConsoleSignIn'
+      },
+      'root-usage'
+    ],
+    // Order: a root user creating an access key is reported as root use.
+    [
+      'root creating an access key',
+      { userIdentity: { type: 'Root' }, eventName: 'CreateAccessKey' },
+      'root-usage'
+    ],
+    [
+      'an IAM user signing in without MFA',
+      {
+        userIdentity: { type: 'IAMUser', userName: 'legacy' },
+        eventName: 'ConsoleLogin',
+        eventSource: 'signin.amazonaws.com',
+        additionalEventData: { MFAUsed: 'No' },
+        responseElements: { ConsoleLogin: 'Success' }
+      },
+      'console-login-without-mfa'
+    ],
+    [
+      'an access key creation the SCP denied',
+      { eventName: 'CreateAccessKey', errorCode: 'AccessDenied' },
+      'iam-user-or-access-key-created'
+    ],
+    [
+      'AdministratorAccess attached to a role',
+      {
+        eventName: 'AttachRolePolicy',
+        requestParameters: {
+          policyArn: 'arn:aws-eusc:iam::aws:policy/AdministratorAccess'
+        }
+      },
+      'administrator-access-attached'
+    ],
+    [
+      'event selectors changed on a trail',
+      {
+        eventSource: 'cloudtrail.amazonaws.com',
+        eventName: 'PutEventSelectors'
+      },
+      'security-service-disabled'
+    ],
+    [
+      'a configuration recorder reconfigured',
+      {
+        eventSource: 'config.amazonaws.com',
+        eventName: 'PutConfigurationRecorder'
+      },
+      'security-service-disabled'
+    ],
+    [
+      'a service detached from the organization',
+      {
+        eventSource: 'organizations.amazonaws.com',
+        eventName: 'DisableAWSServiceAccess'
+      },
+      'security-service-disabled'
+    ],
+    [
+      'a delegated administrator deregistered',
+      {
+        eventSource: 'organizations.amazonaws.com',
+        eventName: 'DeregisterDelegatedAdministrator'
+      },
+      'security-service-disabled'
+    ],
+    [
+      'a KMS key scheduled for deletion',
+      { eventSource: 'kms.amazonaws.com', eventName: 'ScheduleKeyDeletion' },
+      'kms-key-deletion-scheduled'
+    ],
+    [
+      'an SCP updated',
+      { eventSource: 'organizations.amazonaws.com', eventName: 'UpdatePolicy' },
+      'organizations-changed'
+    ],
+    [
+      'a user added to a group in the console',
+      {
+        eventSource: 'sso-directory.amazonaws.com',
+        eventName: 'AddMemberToGroup'
+      },
+      'identity-center-changed'
+    ],
+    [
+      'a user updated through the API',
+      { eventSource: 'identitystore.amazonaws.com', eventName: 'UpdateUser' },
+      'identity-center-changed'
+    ],
+    [
+      'an account assignment created',
+      {
+        eventSource: 'sso.amazonaws.com',
+        eventName: 'CreateAccountAssignment'
+      },
+      'identity-center-changed'
+    ]
+  ]
+
+  for (const [description, overrides, expected] of cases) {
+    it(`reports ${description} as ${expected}`, () => {
+      assert.equal(matchRule(trailRecord(overrides))?.key, expected)
+    })
+  }
+
+  const ignored = [
+    ['a read-only IAM call', {}],
+    [
+      'root activity an AWS service performs',
+      { userIdentity: { type: 'Root', invokedBy: 'cloudtrail.amazonaws.com' } }
+    ],
+    // Identity Center sign-ins never say whether MFA was used.
+    [
+      'an Identity Center console sign-in',
+      {
+        eventName: 'ConsoleLogin',
+        eventSource: 'signin.amazonaws.com',
+        responseElements: { ConsoleLogin: 'Success' }
+      }
+    ],
+    [
+      'a policy other than AdministratorAccess attached',
+      {
+        eventName: 'AttachRolePolicy',
+        requestParameters: {
+          policyArn: 'arn:aws:iam::aws:policy/ReadOnlyAccess'
+        }
+      }
+    ],
+    [
+      'a same-named call to another service',
+      { eventSource: 'ec2.amazonaws.com', eventName: 'DeleteMembers' }
+    ]
+  ]
+
+  for (const [description, overrides] of ignored) {
+    it(`ignores ${description}`, () => {
+      assert.equal(matchRule(trailRecord(overrides)), null)
+    })
+  }
+
+  it('has a unique key and a title for every rule', () => {
+    const keys = CLOUDTRAIL_RULES.map((rule) => rule.key)
+    assert.equal(new Set(keys).size, keys.length)
+    assert.ok(CLOUDTRAIL_RULES.every((rule) => rule.title))
+  })
+})
+
+describe('formatPrincipal', () => {
+  it('names the session and permission set of an Identity Center role', () => {
+    assert.equal(
+      formatPrincipal(SSO_ADMIN),
+      'someone@example.com (AdministratorAccess)'
+    )
+  })
+
+  it('names the role and session of any other assumed role', () => {
+    assert.equal(
+      formatPrincipal({
+        type: 'AssumedRole',
+        arn: 'arn:aws:sts::111111111111:assumed-role/AWSControlTowerExecution/session'
+      }),
+      'AWSControlTowerExecution/session'
+    )
+  })
+
+  it('names root, IAM users and AWS services', () => {
+    assert.equal(formatPrincipal({ type: 'Root' }), 'root')
+    assert.equal(
+      formatPrincipal({ type: 'IAMUser', userName: 'legacy' }),
+      'IAM user legacy'
+    )
+    assert.equal(
+      formatPrincipal({
+        type: 'AWSService',
+        invokedBy: 'config.amazonaws.com'
+      }),
+      'config.amazonaws.com'
+    )
+  })
+
+  it('falls back to whatever identifies an unfamiliar identity type', () => {
+    assert.equal(
+      formatPrincipal({ type: 'IdentityCenterUser', userName: 'someone' }),
+      'someone'
+    )
+    assert.equal(formatPrincipal(undefined), 'unknown')
+  })
+})
+
+describe('groupMatches', () => {
+  const at = (record, timestamp = 1_700_000_000_000) => ({ record, timestamp })
+  const policyUpdate = (eventID, extra = {}) =>
+    trailRecord({
+      eventSource: 'organizations.amazonaws.com',
+      eventName: 'UpdatePolicy',
+      eventID,
+      ...extra
+    })
+
+  it('folds one principal’s calls under one rule and account into a group', () => {
+    const groups = groupMatches([
+      at(policyUpdate('a'), 2000),
+      at(policyUpdate('b'), 1000),
+      at(policyUpdate('c', { eventName: 'AttachPolicy' }), 3000)
+    ])
+
+    assert.equal(groups.length, 1)
+    assert.deepEqual(
+      [...groups[0].eventNames],
+      [
+        ['UpdatePolicy', 2],
+        ['AttachPolicy', 1]
+      ]
+    )
+    assert.deepEqual(groups[0].eventIds, ['a', 'b', 'c'])
+    assert.equal(groups[0].firstTimestamp, 1000)
+  })
+
+  it('keeps different accounts and principals apart', () => {
+    const groups = groupMatches([
+      at(policyUpdate('a')),
+      at(policyUpdate('b', { recipientAccountId: '222222222222' })),
+      at(policyUpdate('c', { userIdentity: { type: 'Root' } }))
+    ])
+
+    // The root call is reported under root-usage, not organizations-changed.
+    assert.deepEqual(
+      groups.map((g) => [g.rule.key, g.account]),
+      [
+        ['organizations-changed', '111111111111'],
+        ['organizations-changed', '222222222222'],
+        ['root-usage', '111111111111']
+      ]
+    )
+  })
+
+  it('names accounts from the map and counts error codes', () => {
+    const [group] = groupMatches(
+      [
+        at(
+          trailRecord({
+            eventName: 'CreateAccessKey',
+            errorCode: 'AccessDenied'
+          })
+        )
+      ],
+      { 111111111111: 'example-dev' }
+    )
+
+    assert.equal(group.account, 'example-dev')
+    assert.deepEqual([...group.errorCodes], [['AccessDenied', 1]])
+  })
+
+  it('returns nothing when no record matches', () => {
+    assert.deepEqual(groupMatches([at(trailRecord({}))]), [])
+  })
+})
+
+describe('buildCloudTrailPayload', () => {
+  const group = (overrides = {}) => ({
+    rule: { key: 'root-usage', title: 'Root user used' },
+    account: 'example-dev',
+    principal: 'root',
+    eventNames: new Map([['ConsoleLogin', 1]]),
+    errorCodes: new Map(),
+    eventIds: ['event-1'],
+    firstTimestamp: Date.parse('2024-01-15T14:30:00Z'),
+    ...overrides
+  })
+
+  it('shows the rule, account, events, principal and time of each group', () => {
+    const payload = buildCloudTrailPayload([group()], {
+      logGroup: 'trail-logs',
+      region: 'eu-west-1'
+    })
+    const text = payload.attachments[0].blocks[0].text.text
+
+    assert.ok(text.includes('*Root user used* in *example-dev*'))
+    assert.ok(text.includes('`ConsoleLogin` by `root` at 16.30.00'))
+    assert.ok(!text.includes('failed'))
+  })
+
+  it('shows counts and failures', () => {
+    const payload = buildCloudTrailPayload(
+      [
+        group({
+          eventNames: new Map([['CreateAccessKey', 3]]),
+          errorCodes: new Map([['AccessDenied', 3]])
+        })
+      ],
+      { logGroup: 'trail-logs' }
+    )
+    const text = payload.attachments[0].blocks[0].text.text
+
+    assert.ok(text.includes('`CreateAccessKey` ×3'))
+    assert.ok(text.includes('failed: `AccessDenied` ×3'))
+  })
+
+  it('links the batch’s events in Logs Insights', () => {
+    const payload = buildCloudTrailPayload([group()], {
+      logGroup: 'trail-logs',
+      region: 'eusc-de-east-1',
+      partition: 'aws-eusc'
+    })
+    const link = payload.attachments[0].blocks[1].text.text
+
+    assert.ok(link.includes('eusc-de-east-1.console.amazonaws-eusc.eu'))
+    assert.ok(link.includes('event-1'))
+    assert.ok(link.includes('trail-logs'))
+  })
+
+  it('caps the groups shown and says how many were left out', () => {
+    const groups = Array.from({ length: 12 }, (_, i) =>
+      group({ account: `account-${i}` })
+    )
+    const blocks = buildCloudTrailPayload(groups, {
+      logGroup: 'trail-logs'
+    }).attachments[0].blocks
+
+    assert.equal(
+      blocks.filter((b) => b.text?.text.includes('Root user')).length,
+      10
+    )
+    assert.ok(blocks.some((b) => b.text?.text.includes('2 more not shown')))
+  })
+
+  it('queries the events by id', () => {
+    assert.ok(
+      buildEventsQuery(['a', 'b']).includes('filter eventID in ["a", "b"]')
+    )
+  })
+})
+
+describe('handler on a log subscription event', () => {
+  let originalFetch
+  let originalLog
+  let originalWarn
+  let posted
+  let fetchResponse
+
+  const context = {
+    invokedFunctionArn:
+      'arn:aws:lambda:eu-west-1:123456789012:function:test-slack-notifier'
+  }
+
+  function subscriptionEvent(batch) {
+    return {
+      awslogs: {
+        data: gzipSync(JSON.stringify(batch)).toString('base64')
+      }
+    }
+  }
+
+  function dataMessage(records, filterName = 'test-slack-notifier-cloudtrail') {
+    return {
+      messageType: 'DATA_MESSAGE',
+      logGroup: 'trail-logs',
+      subscriptionFilters: [filterName],
+      logEvents: records.map((record, i) => ({
+        id: `log-${i}`,
+        timestamp: 1_700_000_000_000 + i,
+        message: JSON.stringify(record)
+      }))
+    }
+  }
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+    originalLog = console.log
+    originalWarn = console.warn
+    console.log = () => {}
+    console.warn = () => {}
+    posted = []
+    fetchResponse = { ok: true, status: 200 }
+    globalThis.fetch = async (_url, init) => {
+      posted.push(JSON.parse(init.body))
+      return fetchResponse
+    }
+    ssmStub.reset()
+    process.env.LOG_SUBSCRIPTIONS_JSON = JSON.stringify({
+      'test-slack-notifier-cloudtrail': {
+        format: 'cloudtrail',
+        channel: '#security',
+        account_names: { 111111111111: 'example-dev' }
+      }
+    })
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    console.log = originalLog
+    console.warn = originalWarn
+    delete process.env.LOG_SUBSCRIPTIONS_JSON
+  })
+
+  it('posts matching events to the subscription’s channel', async () => {
+    const { handler } = await freshModule()
+    await handler(
+      subscriptionEvent(
+        dataMessage([
+          trailRecord({ eventName: 'CreateAccessKey' }),
+          trailRecord({ eventName: 'ListUsers' })
+        ])
+      ),
+      context
+    )
+
+    assert.equal(posted.length, 1)
+    assert.equal(posted[0].channel, '#security')
+    const text = posted[0].attachments[0].blocks[0].text.text
+    assert.ok(text.includes('in *example-dev*'))
+    assert.ok(text.includes('`CreateAccessKey`'))
+  })
+
+  it('posts nothing for a batch without a match', async () => {
+    const { handler } = await freshModule()
+    await handler(subscriptionEvent(dataMessage([trailRecord({})])), context)
+
+    assert.equal(posted.length, 0)
+  })
+
+  it('ignores the control message sent when the filter is created', async () => {
+    const { handler } = await freshModule()
+    await handler(
+      subscriptionEvent({ messageType: 'CONTROL_MESSAGE', logEvents: [] }),
+      context
+    )
+
+    assert.equal(posted.length, 0)
+  })
+
+  it('skips a batch from a subscription filter it has no entry for', async () => {
+    const { handler } = await freshModule()
+    await handler(
+      subscriptionEvent(
+        dataMessage([trailRecord({ eventName: 'CreateAccessKey' })], 'other')
+      ),
+      context
+    )
+
+    assert.equal(posted.length, 0)
+  })
+
+  // Lambda retries a failed asynchronous invocation, so the error must reach it.
+  it('fails the invocation when Slack rejects the post', async () => {
+    fetchResponse = { ok: false, status: 500, text: async () => 'down' }
+    const { handler } = await freshModule()
+
+    await assert.rejects(
+      handler(
+        subscriptionEvent(
+          dataMessage([trailRecord({ eventName: 'CreateAccessKey' })])
+        ),
+        context
+      ),
+      /Failed to post to Slack/
+    )
   })
 })
