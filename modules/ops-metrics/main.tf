@@ -162,6 +162,8 @@ data "archive_file" "ops_metrics" {
   type        = "zip"
   source_dir  = "${path.module}/lambda"
   output_path = "${path.module}/ops_metrics.zip"
+  # Fixed mode so the zip hash is identical on Windows and Unix
+  output_file_mode = "0644"
   excludes = [
     "collector.test.mjs",
     "insights.test.mjs",
