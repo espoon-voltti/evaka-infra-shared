@@ -1043,7 +1043,6 @@ const EVAKA_INSIGHTS_FIELDS =
 const EVAKA_QUERY = [
   'fields @timestamp, @message',
   'filter tolower(logLevel) = "error"',
-  'filter not (loggerName like /^evaka\\.core\\.shared\\.async\\.AsyncJobPool\\./ and meta.remainingAttempts > 0)',
   'filter loggerName not like /^evaka\\.core\\.varda\\./',
   'filter not (exception = "UnableToExecuteStatementException" and (message like /staff_attendance_no_overlaps/ or message like /staff_attendance_plan_no_overlaps/))',
   'sort @timestamp asc',

@@ -136,14 +136,14 @@ log_sources = {
   api-gateway and an nginx frontend under one shared prefix. A log group whose
   entries don't match the source's `format` fails the error-level filter
   silently, so over-broad prefixes lose errors rather than reporting bogus ones.
-- `throw_site_package_prefix` (e.g. `"com.example.app"`) replaces eVaka's
-  hardcoded `at evaka.` stack-frame matching for both the throw-site deep-link
-  line and the `AsyncJobPool` retry-in-progress noise mute, which is derived
-  automatically from it. Omit it to skip both. The derived mute assumes the
-  app's pool logs under `<prefix>.shared.asyncjob.AsyncJobPool.<pool id>` with
-  a `meta.remainingAttempts` field — check the app's `AsyncJobPool` before
-  relying on it, since a mute that matches nothing is invisible. Only
-  `"logback-json"` derives it.
+- `throw_site_package_prefix` is your app's package name, e.g.
+  `"com.example.app"`. Slack messages use it to show the line in your code where
+  the error happened. For `"logback-json"` sources it also hides failed async
+  jobs that will be retried, so only the final failure reaches Slack. That only
+  works if your app logs them as
+  `<prefix>.shared.asyncjob.AsyncJobPool.<pool id>` with a
+  `meta.remainingAttempts` field. Otherwise nothing is hidden and nothing warns
+  you, so check first. Leave this setting out to turn off both.
 - `channel` posts this source's messages to a Slack channel of its own instead
   of the account's, for a source whose volume does not belong in the channel
   the application's own alerts go to. Query failures still warn in the

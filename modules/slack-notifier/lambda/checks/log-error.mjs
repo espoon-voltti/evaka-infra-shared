@@ -48,12 +48,10 @@ export const FORMAT_PRESETS = {
   }
 }
 
-// eVaka's own shape, for the LOG_GROUP_NAMES scan. It emits both an actual
-// `path` and a templated `httpRoute`; it shows the route in the Insights
-// endpoint column while its Slack lines show the path, hence endpointPath
-// alongside httpPath. Its async-job pool logger shares no package prefix with
-// its `at evaka.` throw-site frames, so its mutes are explicit below rather than
-// derived. "evaka" is not a configurable format: the entry synthesises it.
+// The log fields eVaka uses, for the LOG_GROUP_NAMES scan. eVaka logs both the
+// real `path` and the route pattern `httpRoute`. Slack messages show the path
+// and the CloudWatch link shows the route, so both are listed here. "evaka" is
+// not an option in log_sources: the LOG_GROUP_NAMES scan sets it itself.
 export const EVAKA_PRESET = {
   level: 'logLevel',
   logger: 'loggerName',
@@ -97,7 +95,6 @@ const PRESETS = {
 }
 
 const EVAKA_NOISE_FILTERS = [
-  'filter not (loggerName like /^evaka\\.core\\.shared\\.async\\.AsyncJobPool\\./ and meta.remainingAttempts > 0)',
   'filter loggerName not like /^evaka\\.core\\.varda\\./',
   'filter not (exception = "UnableToExecuteStatementException" and (message like /staff_attendance_no_overlaps/ or message like /staff_attendance_plan_no_overlaps/))'
 ]
