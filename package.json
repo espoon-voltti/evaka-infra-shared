@@ -12,6 +12,6 @@
   "private": true,
   "license": "LGPL-2.1-or-later",
   "devDependencies": {
-    "prettier": "3.8.3"
+    "prettier": "3.9.10"
   }
 }
