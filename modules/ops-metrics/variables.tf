@@ -69,3 +69,15 @@ variable "ingestion_delay_seconds" {
   type        = number
   default     = 300
 }
+
+variable "permissions_boundary" {
+  description = "ARN of a permissions boundary policy to attach to the collector and reader IAM roles. Needed where the applying principal is itself under a boundary that denies iam:CreateRole unless the new role carries the same boundary."
+  type        = string
+  default     = null
+}
+
+variable "iam_role_path" {
+  description = "Path of the collector and reader IAM roles. Changing it on an existing deployment replaces both roles. Some accounts only let the applying principal create and pass roles under a given path, such as \"/workload/\"."
+  type        = string
+  default     = "/"
+}

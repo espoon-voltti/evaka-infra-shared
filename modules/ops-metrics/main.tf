@@ -189,8 +189,10 @@ data "archive_file" "ops_metrics" {
 }
 
 resource "aws_iam_role" "collector" {
-  name               = local.collector_function_name
-  assume_role_policy = local.lambda_assume_role_policy
+  name                 = local.collector_function_name
+  path                 = var.iam_role_path
+  permissions_boundary = var.permissions_boundary
+  assume_role_policy   = local.lambda_assume_role_policy
 }
 
 resource "aws_iam_role_policy" "collector" {
@@ -251,8 +253,10 @@ resource "aws_lambda_permission" "collector_eventbridge_invoke" {
 }
 
 resource "aws_iam_role" "reader" {
-  name               = local.reader_function_name
-  assume_role_policy = local.lambda_assume_role_policy
+  name                 = local.reader_function_name
+  path                 = var.iam_role_path
+  permissions_boundary = var.permissions_boundary
+  assume_role_policy   = local.lambda_assume_role_policy
 }
 
 resource "aws_iam_role_policy" "reader" {
