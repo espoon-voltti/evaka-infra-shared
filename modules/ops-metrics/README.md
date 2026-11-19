@@ -305,6 +305,8 @@ response has one URL, for 2026-10-05. Without the header, the response is 401.
 | `raw_retention_days`      | `number`       | no       | `400`                   | Days to keep the 5-minute files.                                                              |
 | `collector_schedule`      | `string`       | no       | `"cron(1/5 * * * ? *)"` | Schedule of the collector. It must run every 5 minutes.                                       |
 | `ingestion_delay_seconds` | `number`       | no       | `300`                   | Time after a bucket closes before the collector reads it.                                     |
+| `permissions_boundary`    | `string`       | no       | `null`                  | ARN of a permissions boundary policy for the collector and reader roles.                      |
+| `iam_role_path`           | `string`       | no       | `"/"`                   | Path of the collector and reader roles. Changing it replaces both roles.                      |
 
 ## Outputs
 
