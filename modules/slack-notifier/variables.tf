@@ -161,13 +161,13 @@ variable "metric_alarms" {
 }
 
 variable "backup_failed_alarm_enabled" {
-  description = "Create the built-in 'backup-failed' metric alarm (AWS/Backup NumberOfBackupJobsFailed, Sum over 1h > 0) and route it to Slack, replacing the central Datadog 'AWS-backup failed' monitor per account. Enabled by default; automatically skipped when alarm_sns_topic_arn is null (no destination to route to). Set to false to opt out."
+  description = "Create the built-in 'backup-failed' alarm and route it to Slack: it fires when, within an hour, an AWS Backup backup job fails or expires (could not start within its start window) or a copy job fails (AWS/Backup NumberOfBackupJobsFailed + NumberOfBackupJobsExpired + NumberOfCopyJobsFailed > 0). Enabled by default; automatically skipped when alarm_sns_topic_arn is null (no destination to route to). Set to false to opt out, or to define a metric_alarms entry named backup-failed."
   type        = bool
   default     = true
 }
 
 variable "backup_failed_alarm_dimensions" {
-  description = "Dimensions for the built-in backup-failed alarm. Empty watches the account/region-level AWS/Backup metric; set { BackupVaultName = \"...\" } to scope to one vault. NOTE: AWS Backup publishes NumberOfBackupJobsFailed per BackupVaultName — verify the empty-dimension metric reports data in this account/region, otherwise scope to a vault."
+  description = "Dimensions for the built-in backup-failed alarm. Empty watches the account-level AWS/Backup metrics of the provider region; set { BackupVaultName = \"...\" } to scope to one vault. Copy jobs are counted under their destination vault's name, so a vault-scoped alarm sees a copy's failure only when the destination vault has the same name."
   type        = map(string)
   default     = {}
 }

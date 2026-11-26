@@ -89,29 +89,16 @@ locals {
     }
   ] : []
 
-  # Built-in backup-failed alarm, merged into the user-supplied metric alarms.
-  # Attribute set matches var.metric_alarms (with optionals resolved) so merge()
-  # yields a single uniform map. User entries win on key collision.
   # Self-gating: enabled by default, but skipped without an SNS topic so a
   # default-on alarm never breaks a log-scan-only (topic-less) consumer.
-  backup_failed_alarm = var.backup_failed_alarm_enabled && var.alarm_sns_topic_arn != null ? {
-    backup-failed = {
-      namespace           = "AWS/Backup"
-      metric_name         = "NumberOfBackupJobsFailed"
-      comparison_operator = "GreaterThanThreshold"
-      threshold           = 0
-      statistic           = "Sum"
-      period              = 3600
-      evaluation_periods  = 1
-      datapoints_to_alarm = null
-      treat_missing_data  = "notBreaching"
-      dimensions          = var.backup_failed_alarm_dimensions
-      alarm_description   = "Backup failed in ${var.name_prefix}"
-      notify_on_ok        = false
-    }
-  } : {}
+  backup_failed_alarm_enabled = var.backup_failed_alarm_enabled && var.alarm_sns_topic_arn != null
 
-  metric_alarms = merge(local.backup_failed_alarm, var.metric_alarms)
+  # Aborted jobs are left out: AWS Backup only aborts a job a user cancelled.
+  backup_failure_metrics = {
+    backup_failed  = "NumberOfBackupJobsFailed"
+    backup_expired = "NumberOfBackupJobsExpired"
+    copy_failed    = "NumberOfCopyJobsFailed"
+  }
 
   # The lambda finds a delivered batch's settings by the filter name the batch
   # carries, so these keys must be the subscription filters' names.
@@ -258,7 +245,7 @@ resource "aws_cloudwatch_log_subscription_filter" "log_subscription" {
 # The lambda's buildAlarmPayload formats any standard CloudWatch alarm message,
 # so no lambda change is needed to support these.
 resource "aws_cloudwatch_metric_alarm" "metric_alarm" {
-  for_each = local.metric_alarms
+  for_each = var.metric_alarms
 
   alarm_name          = "${var.name_prefix}-${each.key}"
   namespace           = each.value.namespace
@@ -282,6 +269,54 @@ resource "aws_cloudwatch_metric_alarm" "metric_alarm" {
       error_message = "slack-notifier metric alarms require alarm_sns_topic_arn to be set so alarms can route to the lambda."
     }
   }
+}
+
+resource "aws_cloudwatch_metric_alarm" "backup_failed" {
+  count = local.backup_failed_alarm_enabled ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-backup-failed"
+  alarm_description   = "Backup or copy job did not complete in ${var.name_prefix}"
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  evaluation_periods  = 1
+  treat_missing_data  = "notBreaching"
+
+  # Without FILL the sum has no datapoint for an hour in which any one of these
+  # metrics was not published, which hides the failures the others report.
+  metric_query {
+    id          = "failures"
+    expression  = join(" + ", [for id in keys(local.backup_failure_metrics) : "FILL(${id}, 0)"])
+    label       = "Failed or expired backup jobs and failed copy jobs"
+    return_data = true
+  }
+
+  dynamic "metric_query" {
+    for_each = local.backup_failure_metrics
+    content {
+      id = metric_query.key
+      metric {
+        namespace   = "AWS/Backup"
+        metric_name = metric_query.value
+        dimensions  = var.backup_failed_alarm_dimensions
+        period      = 3600
+        stat        = "Sum"
+      }
+    }
+  }
+
+  alarm_actions = [var.alarm_sns_topic_arn]
+
+  lifecycle {
+    precondition {
+      condition     = !contains(keys(var.metric_alarms), "backup-failed")
+      error_message = "metric_alarms has a backup-failed entry, which would share this built-in alarm's name. Set backup_failed_alarm_enabled = false to use your own."
+    }
+  }
+}
+
+moved {
+  from = aws_cloudwatch_metric_alarm.metric_alarm["backup-failed"]
+  to   = aws_cloudwatch_metric_alarm.backup_failed[0]
 }
 
 # EventBridge schedule: check logs every 5 minutes, at minutes 2, 7, ... 57. No

@@ -271,11 +271,13 @@ flag removes the schedule, not the lambda's `DescribeAlarms` grant.
 
 `metric_alarms` and the built-in backup alarm are created in the **provider
 region** of the module call, and the alarm/SNS topic must be in that same
-region. CloudWatch metrics are per-region: e.g. AWS Backup publishes
-`NumberOfBackupJobsFailed` in each region where a backup (or copy) job runs, so
-an alarm only covers jobs in its own region. Scope to a vault with
-`backup_failed_alarm_dimensions = { BackupVaultName = "..." }` if the
-account-level (empty-dimension) metric does not report data.
+region. CloudWatch metrics are per-region: AWS Backup publishes its job metrics
+in the region where the job runs, so the backup alarm only covers backups taken
+in its own region. A copy job runs in the region of the backup it copies, so
+copies to another region or account are covered by the source region's alarm.
+The metrics are published both per vault and without dimensions, so the
+default (empty) `backup_failed_alarm_dimensions` watches every vault in the
+region.
 
 ## Inputs
 
@@ -292,8 +294,8 @@ account-level (empty-dimension) metric does not report data.
 | `log_subscriptions`                  | `map(object)`  | no       | `{}`                | Subscription filters pushing a log group's events to the lambda as they arrive. See [Log subscriptions](#log-subscriptions-log_subscriptions).                                                                                                                     |
 | `log_query_seconds`                  | `number`       | no       | `300`               | Sliding window for the log-error scan (`log_group_names` and every `log_sources` entry). The 5-minute schedule is hardcoded and assumes this cadence.                                                                                                              |
 | `metric_alarms`                      | `map(object)`  | no       | `{}`                | CloudWatch metric alarms to create, keyed by alarm-name suffix. Routed to `alarm_sns_topic_arn`. Per-alarm `notify_on_ok` (default `true`) controls whether the green "recovered" message is sent. See variable for fields/defaults.                               |
-| `backup_failed_alarm_enabled`        | `bool`         | no       | `true`              | Create a built-in `backup-failed` alarm (AWS/Backup `NumberOfBackupJobsFailed`, Sum over 1h > 0). On by default; auto-skipped when `alarm_sns_topic_arn` is null. Set `false` to opt out.                                                                          |
-| `backup_failed_alarm_dimensions`     | `map(string)`  | no       | `{}`                | Dimensions for the built-in backup alarm. Empty = account/region-level; set `{ BackupVaultName = "..." }` to scope to a vault.                                                                                                                                     |
+| `backup_failed_alarm_enabled`        | `bool`         | no       | `true`              | Built-in `backup-failed` alarm: a backup job failed or expired, or a copy job failed, within an hour (`NumberOfBackupJobsFailed` + `NumberOfBackupJobsExpired` + `NumberOfCopyJobsFailed` > 0). Auto-skipped when `alarm_sns_topic_arn` is null. `false` opts out. |
+| `backup_failed_alarm_dimensions`     | `map(string)`  | no       | `{}`                | Dimensions for the built-in backup alarm. Empty = every vault in the region; set `{ BackupVaultName = "..." }` to scope to a vault. Copy jobs count under their destination vault's name.                                                                          |
 | `alarm_reminder_enabled`             | `bool`         | no       | `true`              | Post a daily list of the alarms still in `ALARM` state whose actions include `alarm_sns_topic_arn`. Auto-skipped when the topic is null. Set `false` where red alarms are expected. See [Alarm reminder](#alarm-reminder).                                         |
 | `alarm_reminder_schedule_expression` | `string`       | no       | `cron(0 5 * * ? *)` | EventBridge schedule for the alarm reminder.                                                                                                                                                                                                                       |
 | `permissions_boundary`               | `string`       | no       | `null`              | ARN of a permissions boundary to attach to the lambda's IAM role, for accounts whose applying principal may only create roles that carry its own boundary.                                                                                                         |
